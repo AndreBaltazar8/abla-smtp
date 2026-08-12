@@ -1,0 +1,273 @@
+import "abla/crypto"
+import "abla/bytes"
+import "abla/tls/hosted"
+
+class SmtpConfig(
+    val host: string,
+    val port: int,
+    val username: string,
+    val password: string,
+    val ehloName: string,
+    val timeoutMilliseconds: int
+)
+
+class SmtpMessage(
+    val envelopeFrom: string,
+    val fromAddress: string,
+    val fromName: string,
+    val toAddress: string,
+    val toName: string,
+    val subject: string,
+    val textBody: string,
+    val htmlBody: string,
+    val date: string,
+    val messageId: string,
+    val listId: string,
+    val feedbackId: string,
+    val unsubscribeUrl: string
+)
+
+class SmtpReply(
+    val complete: bool,
+    val code: int,
+    val contents: string
+)
+
+class SmtpSendResult(
+    val succeeded: bool,
+    val code: string,
+    val smtpCode: int,
+    val retryable: bool,
+    val permanent: bool,
+    val stage: string,
+    val detail: string
+)
+
+fun smtpContainsNewline(value: string): bool {
+    var found = false
+    var index = 0
+    while (!found && index < value.size) {
+        found = value[index] == 10 || value[index] == 13
+        index = index + 1
+    }
+    found
+}
+
+fun smtpAddressSafe(value: string): bool = value.size > 2 && value.size <= 320 &&
+    !smtpContainsNewline(value) && value[0] != 60 && value[value.size - 1] != 62
+
+fun smtpHeaderSafe(value: string): bool = value.size <= 998 && !smtpContainsNewline(value)
+
+fun smtpBase64Lines(value: string): string {
+    val encoded = base64Encode(value)
+    var result = ""
+    var offset = 0
+    while (offset < encoded.size) {
+        var end = offset + 76
+        if (end > encoded.size) end = encoded.size
+        result = "$result${encoded.slice(offset, end)}\r\n"
+        offset = end
+    }
+    if (encoded.size == 0) "\r\n" else result
+}
+
+fun smtpEncodedWord(value: string): string =
+    if (value == "") "" else "=?UTF-8?B?${base64Encode(value)}?="
+
+fun smtpMailbox(address: string, name: string): string =
+    if (name == "") "<$address>" else "${smtpEncodedWord(name)} <$address>"
+
+fun smtpPlainAuthentication(username: string, password: string): string =
+    base64Encode("${byteEncode(0)}$username${byteEncode(0)}$password")
+
+fun smtpNormalizeCrlf(value: string): string {
+    var result = ""
+    var index = 0
+    while (index < value.size) {
+        if (value[index] == 13) {
+            result = "$result\r\n"
+            if (index + 1 < value.size && value[index + 1] == 10) index = index + 1
+        } else if (value[index] == 10) result = "$result\r\n"
+        else result = "$result${value.slice(index, index + 1)}"
+        index = index + 1
+    }
+    result
+}
+
+fun smtpDotStuff(value: string): string {
+    val normalized = smtpNormalizeCrlf(value)
+    var result = ""
+    var lineStart = true
+    var index = 0
+    while (index < normalized.size) {
+        if (lineStart && normalized[index] == 46) result = "$result."
+        result = "$result${normalized.slice(index, index + 1)}"
+        lineStart = normalized[index] == 10
+        index = index + 1
+    }
+    result
+}
+
+fun smtpMessageValid(message: SmtpMessage): bool =
+    smtpAddressSafe(message.envelopeFrom) &&
+    smtpAddressSafe(message.fromAddress) &&
+    smtpAddressSafe(message.toAddress) &&
+    smtpHeaderSafe(message.fromName) && smtpHeaderSafe(message.toName) &&
+    smtpHeaderSafe(message.subject) && smtpHeaderSafe(message.date) &&
+    smtpHeaderSafe(message.messageId) && smtpHeaderSafe(message.listId) &&
+    smtpHeaderSafe(message.feedbackId) &&
+    smtpHeaderSafe(message.unsubscribeUrl) && message.subject != "" &&
+    message.textBody.size <= 1048576 && message.htmlBody.size <= 2097152 &&
+    message.date != "" && message.messageId != ""
+
+fun smtpRenderMessage(message: SmtpMessage): string {
+    if (!smtpMessageValid(message)) return ""
+    val boundary = "abla-${base64Encode(sha256(message.messageId)).slice(0, 28)}"
+    var result = "Date: ${message.date}\r\n"
+    result = "${result}From: ${smtpMailbox(message.fromAddress, message.fromName)}\r\n"
+    result = "${result}To: ${smtpMailbox(message.toAddress, message.toName)}\r\n"
+    result = "${result}Subject: ${smtpEncodedWord(message.subject)}\r\n"
+    result = "${result}Message-ID: <${message.messageId}>\r\n"
+    result = "${result}MIME-Version: 1.0\r\n"
+    result = "${result}Content-Type: multipart/alternative; boundary=\"$boundary\"\r\n"
+    result = "${result}X-Entity-Ref-ID: ${message.messageId}\r\n"
+    if (message.listId != "") result = "${result}List-ID: ${message.listId}\r\n"
+    if (message.feedbackId != "") result = "${result}Feedback-ID: ${message.feedbackId}\r\n"
+    if (message.unsubscribeUrl != "") {
+        result = "${result}List-Unsubscribe: <${message.unsubscribeUrl}>\r\n"
+        result = "${result}List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"
+    }
+    result = "$result\r\n--$boundary\r\n"
+    result = "${result}Content-Type: text/plain; charset=UTF-8\r\n"
+    result = "${result}Content-Transfer-Encoding: base64\r\n\r\n"
+    result = "$result${smtpBase64Lines(message.textBody)}"
+    result = "$result--$boundary\r\n"
+    result = "${result}Content-Type: text/html; charset=UTF-8\r\n"
+    result = "${result}Content-Transfer-Encoding: base64\r\n\r\n"
+    result = "$result${smtpBase64Lines(message.htmlBody)}"
+    "$result--$boundary--\r\n"
+}
+
+fun smtpDigit(value: int): bool = value >= 48 && value <= 57
+
+fun smtpParseReply(contents: string): SmtpReply {
+    var complete = false
+    var code = 0
+    var lineStart = 0
+    var index = 0
+    while (index + 1 < contents.size) {
+        if (contents[index] == 13 && contents[index + 1] == 10) {
+            val lineSize = index - lineStart
+            if (lineSize >= 4 && smtpDigit(contents[lineStart]) &&
+                smtpDigit(contents[lineStart + 1]) &&
+                smtpDigit(contents[lineStart + 2]) &&
+                contents[lineStart + 3] == 32) {
+                code = (contents[lineStart] - 48) * 100 +
+                    (contents[lineStart + 1] - 48) * 10 +
+                    contents[lineStart + 2] - 48
+                complete = true
+            }
+            lineStart = index + 2
+            index = index + 1
+        }
+        index = index + 1
+    }
+    SmtpReply(complete, code, contents)
+}
+
+fun smtpRead(var connection: TlsConnection): SmtpReply {
+    var contents = ""
+    var reply = smtpParseReply(contents)
+    while (!reply.complete && contents.size < 65536) {
+        val chunk = connection.read(65536 - contents.size)
+        if (chunk.size == 0) return SmtpReply(false, 0, contents)
+        contents = "$contents$chunk"
+        reply = smtpParseReply(contents)
+    }
+    reply
+}
+
+fun smtpCommand(
+    var connection: TlsConnection,
+    command: string
+): SmtpReply {
+    if (connection.write("$command\r\n") != command.size + 2)
+        return SmtpReply(false, 0, "write failed")
+    smtpRead(connection)
+}
+
+fun smtpResult(reply: SmtpReply, stage: string): SmtpSendResult {
+    val retryable = reply.code >= 400 && reply.code < 500
+    val permanent = reply.code >= 500 && reply.code < 600
+    SmtpSendResult(
+        false,
+        if (!reply.complete) "transport_failed"
+        else if (retryable) "temporary_rejection"
+        else if (permanent) "permanent_rejection"
+        else "protocol_error",
+        reply.code,
+        retryable,
+        permanent,
+        stage,
+        "$stage: ${reply.contents}"
+    )
+}
+
+fun smtpAccepted(reply: SmtpReply, code: int): bool =
+    reply.complete && reply.code == code
+
+fun smtpSend(config: SmtpConfig, message: SmtpMessage): SmtpSendResult {
+    val rendered = smtpRenderMessage(message)
+    if (rendered == "") return SmtpSendResult(
+        false, "invalid_message", 0, false, true, "validation", "Invalid message fields."
+    )
+    if (!smtpHeaderSafe(config.username) || !smtpHeaderSafe(config.password) ||
+        !smtpHeaderSafe(config.ehloName)) return SmtpSendResult(
+        false, "invalid_configuration", 0, false, true, "configuration", "Invalid SMTP configuration."
+    )
+    val connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
+    if (connection.handle < 0) return SmtpSendResult(
+        false, "connect_failed", 0, true, false, "connect", tlsLastError()
+    )
+    var reply = smtpRead(connection)
+    var stage = "greeting"
+    var okay = smtpAccepted(reply, 220)
+    if (okay) {
+        stage = "ehlo"
+        reply = smtpCommand(connection, "EHLO ${config.ehloName}")
+        okay = smtpAccepted(reply, 250)
+    }
+    if (okay && config.username != "") {
+        stage = "authentication"
+        val authentication = smtpPlainAuthentication(config.username, config.password)
+        reply = smtpCommand(connection, "AUTH PLAIN $authentication")
+        okay = smtpAccepted(reply, 235)
+    }
+    if (okay) {
+        stage = "sender"
+        reply = smtpCommand(connection, "MAIL FROM:<${message.envelopeFrom}>")
+        okay = smtpAccepted(reply, 250)
+    }
+    if (okay) {
+        stage = "recipient"
+        reply = smtpCommand(connection, "RCPT TO:<${message.toAddress}>")
+        okay = smtpAccepted(reply, 250) || smtpAccepted(reply, 251)
+    }
+    if (okay) {
+        stage = "data"
+        reply = smtpCommand(connection, "DATA")
+        okay = smtpAccepted(reply, 354)
+    }
+    if (okay) {
+        stage = "message"
+        val payload = "${smtpDotStuff(rendered)}.\r\n"
+        if (connection.write(payload) != payload.size)
+            reply = SmtpReply(false, 0, "write failed")
+        else reply = smtpRead(connection)
+        okay = smtpAccepted(reply, 250)
+    }
+    if (okay) smtpCommand(connection, "QUIT")
+    connection.close()
+    if (okay) SmtpSendResult(true, "sent", 250, false, false, "message", "accepted")
+    else smtpResult(reply, stage)
+}

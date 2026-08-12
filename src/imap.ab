@@ -1,0 +1,132 @@
+import "smtp.ab"
+
+class ImapConfig(
+    val host: string,
+    val port: int,
+    val username: string,
+    val password: string,
+    val timeoutMilliseconds: int
+)
+
+class ImapFetchedMessage(
+    val found: bool,
+    val uid: string,
+    val contents: string,
+    val error: string
+)
+
+fun imapContains(value: string, wanted: string): bool {
+    var found = false
+    var index = 0
+    while (!found && index + wanted.size <= value.size) {
+        if (value.slice(index, index + wanted.size) == wanted) found = true
+        index = index + 1
+    }
+    found
+}
+
+fun imapSafeCredential(value: string): bool =
+    value.size > 0 && value.size <= 1024 && !smtpContainsNewline(value)
+
+fun imapQuote(value: string): string {
+    var result = "\""
+    var index = 0
+    while (index < value.size) {
+        if (value[index] == 34 || value[index] == 92) result = "$result\\"
+        result = "$result${value.slice(index, index + 1)}"
+        index = index + 1
+    }
+    "$result\""
+}
+
+fun imapTaggedComplete(value: string, tag: string): bool =
+    imapContains(value, "\r\n$tag OK ") ||
+    imapContains(value, "\r\n$tag NO ") ||
+    imapContains(value, "\r\n$tag BAD ") ||
+    (value.size >= tag.size + 4 && value.slice(0, tag.size + 4) == "$tag OK ")
+
+fun imapReadTagged(
+    var connection: TlsConnection,
+    tag: string,
+    maximum: int = 2097152
+): string {
+    var response = ""
+    while (!imapTaggedComplete(response, tag) && response.size < maximum) {
+        val chunk = connection.read(maximum - response.size)
+        if (chunk.size == 0) return response
+        response = "$response$chunk"
+    }
+    response
+}
+
+fun imapCommand(
+    var connection: TlsConnection,
+    tag: string,
+    command: string,
+    maximum: int = 2097152
+): string {
+    val request = "$tag $command\r\n"
+    if (connection.write(request) != request.size) ""
+    else imapReadTagged(connection, tag, maximum)
+}
+
+fun imapFirstSearchUid(response: string): string {
+    val marker = "* SEARCH "
+    var begin = -1
+    var index = 0
+    while (begin < 0 && index + marker.size <= response.size) {
+        if (response.slice(index, index + marker.size) == marker)
+            begin = index + marker.size
+        index = index + 1
+    }
+    if (begin < 0) return ""
+    while (begin < response.size && response[begin] == 32) begin = begin + 1
+    var end = begin
+    while (end < response.size && smtpDigit(response[end])) end = end + 1
+    response.slice(begin, end)
+}
+
+fun imapFetchFirstUnseen(config: ImapConfig): ImapFetchedMessage {
+    if (!imapSafeCredential(config.username) || !imapSafeCredential(config.password))
+        return ImapFetchedMessage(false, "", "", "invalid configuration")
+    val connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
+    if (connection.handle < 0)
+        return ImapFetchedMessage(false, "", "", tlsLastError())
+    val greeting = connection.read(8192)
+    if (!imapContains(greeting, "* OK")) {
+        connection.close()
+        return ImapFetchedMessage(false, "", "", "invalid greeting")
+    }
+    val login = imapCommand(
+        connection, "A001",
+        "LOGIN ${imapQuote(config.username)} ${imapQuote(config.password)}",
+        65536
+    )
+    if (!imapContains(login, "A001 OK ")) {
+        connection.close()
+        return ImapFetchedMessage(false, "", "", "login failed")
+    }
+    val selected = imapCommand(connection, "A002", "SELECT INBOX", 65536)
+    if (!imapContains(selected, "A002 OK ")) {
+        connection.close()
+        return ImapFetchedMessage(false, "", "", "select failed")
+    }
+    val searched = imapCommand(connection, "A003", "UID SEARCH UNSEEN", 65536)
+    val uid = imapFirstSearchUid(searched)
+    if (uid == "") {
+        imapCommand(connection, "A099", "LOGOUT", 65536)
+        connection.close()
+        return ImapFetchedMessage(false, "", "", "")
+    }
+    val fetched = imapCommand(
+        connection, "A004", "UID FETCH $uid (BODY.PEEK[])", 2097152
+    )
+    val okay = imapContains(fetched, "A004 OK ")
+    if (okay) imapCommand(
+        connection, "A005", "UID STORE $uid +FLAGS.SILENT (\\Seen)", 65536
+    )
+    imapCommand(connection, "A099", "LOGOUT", 65536)
+    connection.close()
+    if (okay) ImapFetchedMessage(true, uid, fetched, "")
+    else ImapFetchedMessage(false, uid, "", "fetch failed")
+}

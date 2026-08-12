@@ -1,0 +1,41 @@
+import "../src/smtp.ab"
+import "../src/imap.ab"
+
+fun contains(value: string, wanted: string): bool {
+    var found = false
+    var index = 0
+    while (!found && index + wanted.size <= value.size) {
+        if (value.slice(index, index + wanted.size) == wanted) found = true
+        index = index + 1
+    }
+    found
+}
+
+fun main: int {
+    val message = SmtpMessage(
+        "bounces+abc@kilo.pt", "updates@kilo.pt", "Kilo",
+        "andre@example.com", "André", "O seu resumo",
+        "Olá André,\n\nUm resumo curto.",
+        "<!doctype html><html lang=\"pt-PT\"><body><p>Olá André.</p></body></html>",
+        "Tue, 11 Aug 2026 12:00:00 +0000",
+        "abc.123@kilo.pt", "novidades.kilo.pt",
+        "launch26:updates:kilopt",
+        "https://kilo.pt/email/unsubscribe/abc"
+    )
+    val rendered = smtpRenderMessage(message)
+    val multi = smtpParseReply("250-mail.kilo.pt\r\n250-PIPELINING\r\n250 AUTH PLAIN\r\n")
+    val temporary = smtpResult(smtpParseReply("451 4.7.1 Try later\r\n"), "recipient")
+    val permanent = smtpResult(smtpParseReply("550 5.1.1 No user\r\n"), "recipient")
+    val dotted = smtpDotStuff("first\n.second\r\n..third\n")
+    val authentication = smtpPlainAuthentication("user", "pass")
+    if (rendered == "" || !contains(rendered, "multipart/alternative") ||
+        !contains(rendered, "List-Unsubscribe-Post: List-Unsubscribe=One-Click") ||
+        !contains(rendered, "Feedback-ID: launch26:updates:kilopt") ||
+        !contains(rendered, "=?UTF-8?B?") || !multi.complete || multi.code != 250 ||
+        !temporary.retryable || temporary.permanent || !permanent.permanent ||
+        permanent.retryable || dotted != "first\r\n..second\r\n...third\r\n" ||
+        authentication != "AHVzZXIAcGFzcw==" ||
+        imapFirstSearchUid("* SEARCH 42 91\r\nA003 OK done\r\n") != "42" ||
+        imapFirstSearchUid("* SEARCH\r\nA003 OK done\r\n") != "") 1
+    else 0
+}
