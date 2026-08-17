@@ -5,6 +5,9 @@ verified implicit TLS (normally port 465), AUTH PLAIN inside TLS, bounded SMTP
 replies, UTF-8 encoded headers, multipart text/HTML bodies, base64 transfer
 encoding and dot stuffing.
 
+Connection setup is bounded to Abla's supported 1–10 second TCP window even if
+the caller supplies a wider timeout.
+
 Subscription messages can include RFC 8058 one-click unsubscribe headers and a
 Gmail Feedback Loop identifier.
 Delivery policy is deliberately left to the application: a `4xx` result is
