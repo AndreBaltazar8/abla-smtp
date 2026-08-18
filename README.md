@@ -24,6 +24,7 @@ The caller supplies the RFC 5322 date and globally unique Message-ID. Passwords
 should come from mounted secret files and must never be logged. Use separate
 sender identities and lists for transactional mail and consented product news.
 
-`src/imap.ab` also contains a small certificate-verified IMAP4 client for
+The package root also exposes a small certificate-verified IMAP4 client for
 polling an operational bounce mailbox one unseen message at a time. It uses UID
-commands and marks a message seen only after a complete fetch.
+commands and marks a message seen only after a complete fetch, so consumers do
+not need a repository-relative import to ingest delivery feedback.
