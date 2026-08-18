@@ -15,6 +15,11 @@ class ImapFetchedMessage(
     val error: string
 )
 
+class ImapActionResult(
+    val succeeded: bool,
+    val error: string
+)
+
 fun imapContains(value: string, wanted: string): bool {
     var found = false
     var index = 0
@@ -43,6 +48,10 @@ fun imapTaggedComplete(value: string, tag: string): bool =
     imapContains(value, "\r\n$tag OK ") ||
     imapContains(value, "\r\n$tag NO ") ||
     imapContains(value, "\r\n$tag BAD ") ||
+    (value.size >= tag.size + 4 && value.slice(0, tag.size + 4) == "$tag OK ")
+
+fun imapTaggedOkay(value: string, tag: string): bool =
+    imapContains(value, "\r\n$tag OK ") ||
     (value.size >= tag.size + 4 && value.slice(0, tag.size + 4) == "$tag OK ")
 
 fun imapReadTagged(
@@ -126,6 +135,10 @@ fun imapFetchFirstUnseenConfigured(
         return ImapFetchedMessage(false, "", "", "select failed")
     }
     val searched = imapCommand(connection, "A003", "UID SEARCH UNSEEN", 65536)
+    if (!imapTaggedOkay(searched, "A003")) {
+        connection.close()
+        return ImapFetchedMessage(false, "", "", "search failed")
+    }
     val uid = imapFirstSearchUid(searched)
     if (uid == "") {
         imapCommand(connection, "A099", "LOGOUT", 65536)
@@ -135,14 +148,19 @@ fun imapFetchFirstUnseenConfigured(
     val fetched = imapCommand(
         connection, "A004", "UID FETCH $uid (BODY.PEEK[])", 2097152
     )
-    val okay = imapContains(fetched, "A004 OK ")
-    if (okay && markSeen) imapCommand(
-        connection, "A005", "UID STORE $uid +FLAGS.SILENT (\\Seen)", 65536
-    )
+    var okay = imapTaggedOkay(fetched, "A004")
+    var error = if (okay) "" else "fetch failed"
+    if (okay && markSeen) {
+        val stored = imapCommand(
+            connection, "A005", "UID STORE $uid +FLAGS.SILENT (\\Seen)", 65536
+        )
+        okay = imapTaggedOkay(stored, "A005")
+        if (!okay) error = "mark seen failed"
+    }
     imapCommand(connection, "A099", "LOGOUT", 65536)
     connection.close()
     if (okay) ImapFetchedMessage(true, uid, fetched, "")
-    else ImapFetchedMessage(false, uid, "", "fetch failed")
+    else ImapFetchedMessage(false, uid, "", error)
 }
 
 fun imapFetchFirstUnseen(config: ImapConfig): ImapFetchedMessage =
@@ -151,33 +169,40 @@ fun imapFetchFirstUnseen(config: ImapConfig): ImapFetchedMessage =
 fun imapPeekFirstUnseen(config: ImapConfig): ImapFetchedMessage =
     imapFetchFirstUnseenConfigured(config, false)
 
-fun imapMarkSeen(config: ImapConfig, uid: string): bool {
+fun imapMarkSeenResult(config: ImapConfig, uid: string): ImapActionResult {
     if (!imapSafeCredential(config.username) ||
-        !imapSafeCredential(config.password) || !imapUidValid(uid)) return false
+        !imapSafeCredential(config.password) || !imapUidValid(uid))
+        return ImapActionResult(false, "invalid configuration")
     val connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
-    if (connection.handle < 0) return false
+    if (connection.handle < 0) return ImapActionResult(false, tlsLastError())
     val greeting = connection.read(8192)
     if (!imapContains(greeting, "* OK")) {
         connection.close()
-        return false
+        return ImapActionResult(false, "invalid greeting")
     }
     val login = imapCommand(
         connection, "A001",
         "LOGIN ${imapQuote(config.username)} ${imapQuote(config.password)}",
         65536
     )
-    var okay = imapContains(login, "A001 OK ")
+    var okay = imapTaggedOkay(login, "A001")
+    var error = if (okay) "" else "login failed"
     if (okay) {
         val selected = imapCommand(connection, "A002", "SELECT INBOX", 65536)
-        okay = imapContains(selected, "A002 OK ")
+        okay = imapTaggedOkay(selected, "A002")
+        if (!okay) error = "select failed"
     }
     if (okay) {
         val stored = imapCommand(
             connection, "A003", "UID STORE $uid +FLAGS.SILENT (\\Seen)", 65536
         )
-        okay = imapContains(stored, "A003 OK ")
+        okay = imapTaggedOkay(stored, "A003")
+        if (!okay) error = "mark seen failed"
     }
     imapCommand(connection, "A099", "LOGOUT", 65536)
     connection.close()
-    okay
+    ImapActionResult(okay, error)
 }
+
+fun imapMarkSeen(config: ImapConfig, uid: string): bool =
+    imapMarkSeenResult(config, uid).succeeded
