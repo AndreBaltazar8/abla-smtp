@@ -25,6 +25,7 @@ should come from mounted secret files and must never be logged. Use separate
 sender identities and lists for transactional mail and consented product news.
 
 The package root also exposes a small certificate-verified IMAP4 client for
-polling an operational bounce mailbox one unseen message at a time. It uses UID
-commands and marks a message seen only after a complete fetch, so consumers do
-not need a repository-relative import to ingest delivery feedback.
+polling an operational bounce mailbox one unseen message at a time. The default
+fetch marks a complete message seen; durable consumers can instead peek, commit
+their feedback event, and then mark that exact UID seen. Consumers do not need a
+repository-relative import to ingest delivery feedback.

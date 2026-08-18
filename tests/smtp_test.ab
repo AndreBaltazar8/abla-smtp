@@ -37,6 +37,7 @@ fun main: int {
         authentication != "AHVzZXIAcGFzcw==" ||
         smtpConnectTimeout(0) != 1 || smtpConnectTimeout(15000) != 10000 ||
         smtpConnectTimeout(5000) != 5000 ||
+        !imapUidValid("42") || imapUidValid("") || imapUidValid("42 EXPUNGE") ||
         imapFirstSearchUid("* SEARCH 42 91\r\nA003 OK done\r\n") != "42" ||
         imapFirstSearchUid("* SEARCH\r\nA003 OK done\r\n") != "") 1
     else 0

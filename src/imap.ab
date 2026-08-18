@@ -86,7 +86,21 @@ fun imapFirstSearchUid(response: string): string {
     response.slice(begin, end)
 }
 
-fun imapFetchFirstUnseen(config: ImapConfig): ImapFetchedMessage {
+fun imapUidValid(uid: string): bool {
+    if (uid == "" || uid.size > 20) return false
+    var valid = true
+    var index = 0
+    while (valid && index < uid.size) {
+        valid = smtpDigit(uid[index])
+        index = index + 1
+    }
+    valid
+}
+
+fun imapFetchFirstUnseenConfigured(
+    config: ImapConfig,
+    markSeen: bool
+): ImapFetchedMessage {
     if (!imapSafeCredential(config.username) || !imapSafeCredential(config.password))
         return ImapFetchedMessage(false, "", "", "invalid configuration")
     val connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
@@ -122,11 +136,48 @@ fun imapFetchFirstUnseen(config: ImapConfig): ImapFetchedMessage {
         connection, "A004", "UID FETCH $uid (BODY.PEEK[])", 2097152
     )
     val okay = imapContains(fetched, "A004 OK ")
-    if (okay) imapCommand(
+    if (okay && markSeen) imapCommand(
         connection, "A005", "UID STORE $uid +FLAGS.SILENT (\\Seen)", 65536
     )
     imapCommand(connection, "A099", "LOGOUT", 65536)
     connection.close()
     if (okay) ImapFetchedMessage(true, uid, fetched, "")
     else ImapFetchedMessage(false, uid, "", "fetch failed")
+}
+
+fun imapFetchFirstUnseen(config: ImapConfig): ImapFetchedMessage =
+    imapFetchFirstUnseenConfigured(config, true)
+
+fun imapPeekFirstUnseen(config: ImapConfig): ImapFetchedMessage =
+    imapFetchFirstUnseenConfigured(config, false)
+
+fun imapMarkSeen(config: ImapConfig, uid: string): bool {
+    if (!imapSafeCredential(config.username) ||
+        !imapSafeCredential(config.password) || !imapUidValid(uid)) return false
+    val connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
+    if (connection.handle < 0) return false
+    val greeting = connection.read(8192)
+    if (!imapContains(greeting, "* OK")) {
+        connection.close()
+        return false
+    }
+    val login = imapCommand(
+        connection, "A001",
+        "LOGIN ${imapQuote(config.username)} ${imapQuote(config.password)}",
+        65536
+    )
+    var okay = imapContains(login, "A001 OK ")
+    if (okay) {
+        val selected = imapCommand(connection, "A002", "SELECT INBOX", 65536)
+        okay = imapContains(selected, "A002 OK ")
+    }
+    if (okay) {
+        val stored = imapCommand(
+            connection, "A003", "UID STORE $uid +FLAGS.SILENT (\\Seen)", 65536
+        )
+        okay = imapContains(stored, "A003 OK ")
+    }
+    imapCommand(connection, "A099", "LOGOUT", 65536)
+    connection.close()
+    okay
 }
