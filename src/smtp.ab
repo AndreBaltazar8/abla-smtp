@@ -1,6 +1,7 @@
 import "abla/crypto"
 import "abla/bytes"
 import "abla/tls/hosted"
+import "abla/text"
 
 class SmtpConfig(
     val host: string,
@@ -24,7 +25,14 @@ class SmtpMessage(
     val messageId: string,
     val listId: string,
     val feedbackId: string,
-    val unsubscribeUrl: string
+    val unsubscribeUrl: string,
+    // Replies: the parent's Message-ID, and the thread's Message-IDs oldest
+    // first (with or without angle brackets, separated by spaces).
+    val inReplyTo: string = "",
+    val references: string = "",
+    // More recipients, plain addresses; all of them get the message.
+    val extraTo: array<string> = [],
+    val cc: array<string> = []
 )
 
 class SmtpReply(
@@ -133,6 +141,46 @@ fun smtpDotStuff(value: string): string {
     result
 }
 
+// A plain address that is safe to list in To or Cc.
+fun smtpRecipientSafe(value: string): bool {
+    if (!smtpAddressSafe(value)) return false
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte <= 32 || byte == 44 || byte == 59 || byte == 60 || byte == 62 || byte == 34)
+            return false
+        index = index + 1
+    }
+    true
+}
+
+fun smtpRecipientsSafe(values: array<string>): bool {
+    for (value in values) if (!smtpRecipientSafe(value)) return false
+    true
+}
+
+// Message-IDs from `value` (bracketed or not, separated by spaces or commas)
+// rendered as "<a>" lines folded for a header; "" if any is malformed.
+fun smtpMessageIds(value: string): string {
+    var result = ""
+    var count = 0
+    var index = 0
+    while (index < value.size) {
+        while (index < value.size && (value[index] <= 32 || value[index] == 44)) index = index + 1
+        val begin = index
+        while (index < value.size && value[index] > 32 && value[index] != 44) index = index + 1
+        if (index > begin) {
+            var id = value.slice(begin, index)
+            if (id.size >= 2 && id[0] == 60 && id[id.size - 1] == 62) id = id.slice(1, id.size - 1)
+            if (id.size > 900 || !smtpRecipientSafe("x$id") || textFindByte(id, 64, 0, id.size) < 0 ||
+                count >= 100) return ""
+            result = if (result == "") "<$id>" else "$result\r\n <$id>"
+            count = count + 1
+        }
+    }
+    result
+}
+
 fun smtpMessageValid(message: SmtpMessage): bool =
     smtpAddressSafe(message.envelopeFrom) &&
     smtpAddressSafe(message.fromAddress) &&
@@ -143,18 +191,44 @@ fun smtpMessageValid(message: SmtpMessage): bool =
     smtpHeaderSafe(message.feedbackId) &&
     smtpHeaderSafe(message.unsubscribeUrl) && message.subject != "" &&
     message.textBody.size <= 1048576 && message.htmlBody.size <= 2097152 &&
-    message.date != "" && message.messageId != ""
+    message.date != "" && message.messageId != "" &&
+    smtpRecipientsSafe(message.extraTo) && smtpRecipientsSafe(message.cc) &&
+    message.extraTo.size + message.cc.size < 100 &&
+    !smtpContainsNewline(message.inReplyTo) && !smtpContainsNewline(message.references) &&
+    (message.inReplyTo == "" || smtpMessageIds(message.inReplyTo) != "") &&
+    (message.references == "" || smtpMessageIds(message.references) != "")
+
+fun smtpAddressList(addresses: array<string>): string {
+    var result = ""
+    for (address in addresses) result = if (result == "") "<$address>" else "$result,\r\n <$address>"
+    result
+}
+
+// The envelope recipients: To, the extra To addresses and Cc.
+fun smtpRecipients(message: SmtpMessage): array<string> {
+    val recipients: array<string> = [message.toAddress]
+    for (address in message.extraTo) recipients.append(address)
+    for (address in message.cc) recipients.append(address)
+    recipients
+}
 
 fun smtpRenderMessage(message: SmtpMessage): string {
     if (!smtpMessageValid(message)) return ""
     val boundary = "=_${hexEncode(sha256(message.messageId)).slice(0, 48)}"
     var result = "Date: ${message.date}\r\n"
     result = "${result}From: ${smtpMailbox(message.fromAddress, message.fromName)}\r\n"
-    result = "${result}To: ${smtpMailbox(message.toAddress, message.toName)}\r\n"
+    result = "${result}To: ${smtpMailbox(message.toAddress, message.toName)}"
+    if (message.extraTo.size > 0) result = "$result,\r\n ${smtpAddressList(message.extraTo)}"
+    result = "$result\r\n"
+    if (message.cc.size > 0) result = "${result}Cc: ${smtpAddressList(message.cc)}\r\n"
     result = "${result}Subject: ${smtpHeaderText(message.subject)}\r\n"
     result = "${result}Message-ID: <${message.messageId}>\r\n"
+    if (message.inReplyTo != "") result = "${result}In-Reply-To: ${smtpMessageIds(message.inReplyTo)}\r\n"
+    if (message.references != "") result = "${result}References: ${smtpMessageIds(message.references)}\r\n"
     result = "${result}MIME-Version: 1.0\r\n"
-    result = "${result}Content-Type: multipart/alternative; boundary=\"$boundary\"\r\n"
+    result = if (message.htmlBody == "")
+        "${result}Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n"
+    else "${result}Content-Type: multipart/alternative; boundary=\"$boundary\"\r\n"
     result = "${result}X-Entity-Ref-ID: ${message.messageId}\r\n"
     if (message.listId != "") result = "${result}List-ID: ${message.listId}\r\n"
     if (message.feedbackId != "") result = "${result}Feedback-ID: ${message.feedbackId}\r\n"
@@ -162,6 +236,9 @@ fun smtpRenderMessage(message: SmtpMessage): string {
         result = "${result}List-Unsubscribe: <${message.unsubscribeUrl}>\r\n"
         result = "${result}List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"
     }
+    // Without HTML the message is the text alone: an empty HTML alternative
+    // would be what most clients show.
+    if (message.htmlBody == "") return "$result\r\n${smtpBase64Lines(message.textBody)}"
     result = "$result\r\n--$boundary\r\n"
     result = "${result}Content-Type: text/plain; charset=UTF-8\r\n"
     result = "${result}Content-Transfer-Encoding: base64\r\n\r\n"
@@ -276,10 +353,12 @@ fun smtpSend(config: SmtpConfig, message: SmtpMessage, startTls: bool = false): 
         reply = smtpCommand(connection, "MAIL FROM:<${message.envelopeFrom}>")
         okay = smtpAccepted(reply, 250)
     }
-    if (okay) {
-        stage = "recipient"
-        reply = smtpCommand(connection, "RCPT TO:<${message.toAddress}>")
-        okay = smtpAccepted(reply, 250) || smtpAccepted(reply, 251)
+    for (recipient in smtpRecipients(message)) {
+        if (okay) {
+            stage = "recipient"
+            reply = smtpCommand(connection, "RCPT TO:<$recipient>")
+            okay = smtpAccepted(reply, 250) || smtpAccepted(reply, 251)
+        }
     }
     if (okay) {
         stage = "data"

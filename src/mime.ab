@@ -1,0 +1,745 @@
+import "abla/crypto"
+import "abla/bytes"
+import "abla/text"
+
+// A reader for received mail: headers plus a plain-text body. It decodes
+// quoted-printable, base64, RFC 2047 headers and UTF-8/Latin-1 text, prefers
+// text/plain over HTML and lists attachments without decoding them.
+
+class MimeHeader(val name: string, val value: string)
+
+class MimeAttachment(
+    val name: string,
+    val contentType: string,
+    val size: int
+)
+
+class MimeMessage(
+    val headers: array<MimeHeader>,
+    val from: string,
+    val to: string,
+    val cc: string,
+    val subject: string,
+    val date: string,
+    val messageId: string,
+    val inReplyTo: string,
+    val references: string,
+    val text: string,
+    val textFromHtml: bool,
+    val truncated: bool,
+    val attachments: array<MimeAttachment>
+)
+
+class MimeContentType(val mediaType: string, val parameters: array<MimeHeader>)
+
+class MimeText(val text: string, val fromHtml: bool)
+
+class MimeCollector(
+    val attachments: array<MimeAttachment>,
+    var parts: int
+)
+
+val mimeMaximumDepth = 8
+val mimeMaximumParts = 256
+val mimeMaximumHeaders = 256
+val mimeMaximumHeaderValue = 65536
+val mimeMaximumText = 1048576
+
+fun mimeWhitespace(value: int): bool =
+    value == 32 || value == 9 || value == 13 || value == 10
+
+fun mimeHexValue(value: int): int =
+    if (value >= 48 && value <= 57) value - 48
+    else if (value >= 65 && value <= 70) value - 55
+    else if (value >= 97 && value <= 102) value - 87
+    else -1
+
+fun mimeTrim(value: string): string {
+    var begin = 0
+    var end = value.size
+    while (begin < end && mimeWhitespace(value[begin])) begin = begin + 1
+    while (end > begin && mimeWhitespace(value[end - 1])) end = end - 1
+    value.slice(begin, end)
+}
+
+fun mimeLower(value: string): string = value.lowercase()
+
+// Windows-1252 code points for 0x80..0x9F; mail labelled ISO-8859-1 is
+// usually Windows-1252 in practice, as browsers also assume.
+fun mimeWindows1252(byte: int): int {
+    val table = [
+        8364, 129, 8218, 402, 8222, 8230, 8224, 8225,
+        710, 8240, 352, 8249, 338, 141, 381, 143,
+        144, 8216, 8217, 8220, 8221, 8226, 8211, 8212,
+        732, 8482, 353, 8250, 339, 157, 382, 376
+    ]
+    if (byte >= 128 && byte < 160) table[byte - 128] else byte
+}
+
+fun mimeAscii(value: string): bool {
+    var index = 0
+    while (index < value.size) {
+        if (value[index] >= 128) return false
+        index = index + 1
+    }
+    true
+}
+
+fun mimeLatin1ToUtf8(value: string): string {
+    if (mimeAscii(value)) return value
+    val buffer = byteBuffer()
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte < 128) buffer.appendByteValue(byte)
+        else buffer.appendText(utf8Encode(mimeWindows1252(byte)))
+        index = index + 1
+    }
+    buffer.toText()
+}
+
+fun mimeLatin1Charset(charset: string): bool =
+    charset == "iso-8859-1" || charset == "iso8859-1" || charset == "latin1" ||
+    charset == "latin-1" || charset == "l1" || charset == "iso_8859-1" ||
+    charset == "windows-1252" || charset == "cp1252" || charset == "iso-8859-15"
+
+// Converts text in `charset` to UTF-8. UTF-8 and unknown charsets pass through
+// when they are valid UTF-8; anything else is read as Latin-1.
+fun mimeToUtf8(value: string, charset: string): string {
+    val normal = mimeLower(mimeTrim(charset))
+    if (mimeLatin1Charset(normal)) mimeLatin1ToUtf8(value)
+    else if (value.isValidUtf8()) value
+    else mimeLatin1ToUtf8(value)
+}
+
+// Quoted-printable (RFC 2045). `header` selects the RFC 2047 Q form, where
+// "_" is a space. Malformed escapes are kept as written.
+fun mimeQuotedPrintableDecode(value: string, header: bool = false): string {
+    val buffer = byteBuffer()
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte == 61) {
+            var next = index + 1
+            while (next < value.size && (value[next] == 32 || value[next] == 9)) next = next + 1
+            if (next < value.size && value[next] == 13) next = next + 1
+            if (next < value.size && value[next] == 10) {
+                index = next + 1
+            } else if (index + 2 < value.size && mimeHexValue(value[index + 1]) >= 0 &&
+                mimeHexValue(value[index + 2]) >= 0) {
+                buffer.appendByteValue(mimeHexValue(value[index + 1]) * 16 + mimeHexValue(value[index + 2]))
+                index = index + 3
+            } else {
+                buffer.appendByteValue(byte)
+                index = index + 1
+            }
+        } else if (header && byte == 95) {
+            buffer.appendByteValue(32)
+            index = index + 1
+        } else {
+            var end = textFindByte(value, 61, index, value.size)
+            if (end < 0) end = value.size
+            if (header) {
+                val underscore = textFindByte(value, 95, index, end)
+                if (underscore >= 0) end = underscore
+            }
+            buffer.appendText(value.slice(index, end))
+            index = end
+        }
+    }
+    buffer.toText()
+}
+
+fun mimeBase64Character(value: int): bool =
+    (value >= 65 && value <= 90) || (value >= 97 && value <= 122) ||
+    (value >= 48 && value <= 57) || value == 43 || value == 47
+
+// Base64 that ignores line breaks and other noise, and tolerates missing padding.
+fun mimeBase64Decode(value: string): string {
+    val buffer = byteBuffer()
+    var count = 0
+    var index = 0
+    while (index < value.size && value[index] != 61) {
+        if (mimeBase64Character(value[index])) {
+            buffer.appendByteValue(value[index])
+            count = count + 1
+        }
+        index = index + 1
+    }
+    if (count % 4 == 1) return ""
+    while (count % 4 != 0) {
+        buffer.appendByteValue(61)
+        count = count + 1
+    }
+    base64Decode(buffer.toText())
+}
+
+fun mimeBase64DecodedSize(value: string): int {
+    var count = 0
+    var index = 0
+    while (index < value.size && value[index] != 61) {
+        if (mimeBase64Character(value[index])) count = count + 1
+        index = index + 1
+    }
+    count / 4 * 3 + (if (count % 4 == 3) 2 else if (count % 4 == 2) 1 else 0)
+}
+
+// Decodes RFC 2047 encoded words; whitespace between two encoded words is
+// dropped. Raw 8-bit text is kept when it is UTF-8 and read as Latin-1 otherwise.
+fun mimeDecodeHeader(value: string): string {
+    val buffer = byteBuffer()
+    var position = 0
+    var lastEncoded = false
+    while (position < value.size) {
+        val start = textFindSequence(value, "=?", position, value.size)
+        if (start < 0) {
+            buffer.appendText(mimeToUtf8(value.slice(position, value.size), ""))
+            position = value.size
+        } else {
+            val charsetEnd = textFindByte(value, 63, start + 2, value.size)
+            var end = -1
+            if (charsetEnd > start + 2 && charsetEnd + 2 < value.size && value[charsetEnd + 2] == 63)
+                end = textFindSequence(value, "?=", charsetEnd + 3, value.size)
+            val encoding = if (end < 0) 0 else value[charsetEnd + 1]
+            val encodedText = if (end < 0) "" else value.slice(charsetEnd + 3, end)
+            val valid = end >= 0 && textFindByte(encodedText, 32, 0, encodedText.size) < 0 &&
+                (encoding == 66 || encoding == 98 || encoding == 81 || encoding == 113)
+            if (!valid) {
+                buffer.appendText(mimeToUtf8(value.slice(position, start + 2), ""))
+                position = start + 2
+                lastEncoded = false
+            } else {
+                val gap = value.slice(position, start)
+                if (!(lastEncoded && mimeTrim(gap) == "")) buffer.appendText(mimeToUtf8(gap, ""))
+                var charset = value.slice(start + 2, charsetEnd)
+                val language = textFindByte(charset, 42, 0, charset.size)
+                if (language >= 0) charset = charset.slice(0, language)
+                val decoded = if (encoding == 66 || encoding == 98) mimeBase64Decode(encodedText)
+                    else mimeQuotedPrintableDecode(encodedText, true)
+                buffer.appendText(mimeToUtf8(decoded, charset))
+                position = end + 2
+                lastEncoded = true
+            }
+        }
+    }
+    buffer.toText()
+}
+
+// The offset where the header block ends and the body begins within
+// [begin, end). The body begins after the first empty line.
+fun mimeBodyBegin(raw: string, begin: int, end: int): int {
+    if (begin < end && raw[begin] == 10) return begin + 1
+    if (begin + 1 < end && raw[begin] == 13 && raw[begin + 1] == 10) return begin + 2
+    val crlf = textFindSequence(raw, "\r\n\r\n", begin, end)
+    val lf = textFindSequence(raw, "\n\n", begin, end)
+    if (crlf >= 0 && (lf < 0 || crlf < lf)) crlf + 4
+    else if (lf >= 0) lf + 2
+    else end
+}
+
+// Unfolded header fields, values as written (not decoded).
+fun mimeParseHeaders(raw: string, begin: int, end: int): array<MimeHeader> {
+    val headers: array<MimeHeader> = []
+    var name = ""
+    var value = ""
+    var position = begin
+    while (position < end) {
+        var lineEnd = textFindByte(raw, 10, position, end)
+        if (lineEnd < 0) lineEnd = end
+        var contentEnd = lineEnd
+        if (contentEnd > position && raw[contentEnd - 1] == 13) contentEnd = contentEnd - 1
+        val line = raw.slice(position, contentEnd)
+        if (line.size > 0 && (line[0] == 32 || line[0] == 9)) {
+            if (name != "" && value.size + line.size <= mimeMaximumHeaderValue) value = "$value$line"
+        } else if (line.size > 0) {
+            if (name != "" && headers.size < mimeMaximumHeaders)
+                headers.append(MimeHeader(name, mimeTrim(value)))
+            val colon = textFindByte(line, 58, 0, line.size)
+            if (colon > 0) {
+                name = mimeTrim(line.slice(0, colon))
+                value = line.slice(colon + 1, line.size)
+                if (value.size > mimeMaximumHeaderValue) value = value.slice(0, mimeMaximumHeaderValue)
+            } else {
+                name = ""
+                value = ""
+            }
+        }
+        position = lineEnd + 1
+    }
+    if (name != "" && headers.size < mimeMaximumHeaders)
+        headers.append(MimeHeader(name, mimeTrim(value)))
+    headers
+}
+
+// The first header called `name` (any case), as written, or "".
+fun mimeHeaderRaw(headers: array<MimeHeader>, name: string): string {
+    for (header in headers) {
+        if (textAsciiEqualInsensitive(header.name, name)) return header.value
+    }
+    ""
+}
+
+// The first header called `name`, with RFC 2047 words decoded.
+fun mimeHeader(headers: array<MimeHeader>, name: string): string =
+    mimeDecodeHeader(mimeHeaderRaw(headers, name))
+
+// `type/subtype; name=value; name="quoted value"` with the type lowercased
+// and parameter names lowercased.
+fun mimeParseContentType(value: string): MimeContentType {
+    val parameters: array<MimeHeader> = []
+    var position = textFindByte(value, 59, 0, value.size)
+    if (position < 0) position = value.size
+    val mediaType = mimeLower(mimeTrim(value.slice(0, position)))
+    while (position < value.size && parameters.size < 64) {
+        while (position < value.size && (value[position] == 59 || mimeWhitespace(value[position])))
+            position = position + 1
+        var equals = position
+        while (equals < value.size && value[equals] != 61 && value[equals] != 59) equals = equals + 1
+        if (equals >= value.size || value[equals] == 59) {
+            position = equals
+        } else {
+            val name = mimeLower(mimeTrim(value.slice(position, equals)))
+            var cursor = equals + 1
+            while (cursor < value.size && mimeWhitespace(value[cursor])) cursor = cursor + 1
+            var parameter = ""
+            if (cursor < value.size && value[cursor] == 34) {
+                val buffer = byteBuffer()
+                cursor = cursor + 1
+                while (cursor < value.size && value[cursor] != 34) {
+                    if (value[cursor] == 92 && cursor + 1 < value.size) cursor = cursor + 1
+                    buffer.appendByteValue(value[cursor])
+                    cursor = cursor + 1
+                }
+                parameter = buffer.toText()
+                while (cursor < value.size && value[cursor] != 59) cursor = cursor + 1
+            } else {
+                val begin = cursor
+                while (cursor < value.size && value[cursor] != 59) cursor = cursor + 1
+                parameter = mimeTrim(value.slice(begin, cursor))
+            }
+            if (name != "") parameters.append(MimeHeader(name, parameter))
+            position = cursor
+        }
+    }
+    MimeContentType(if (mediaType == "") "text/plain" else mediaType, parameters)
+}
+
+fun mimeParameterRaw(parameters: array<MimeHeader>, name: string): string? {
+    for (parameter in parameters) {
+        if (parameter.name == name) return parameter.value
+    }
+    null
+}
+
+fun mimePercentDecode(value: string): string {
+    val buffer = byteBuffer()
+    var index = 0
+    while (index < value.size) {
+        if (value[index] == 37 && index + 2 < value.size &&
+            mimeHexValue(value[index + 1]) >= 0 && mimeHexValue(value[index + 2]) >= 0) {
+            buffer.appendByteValue(mimeHexValue(value[index + 1]) * 16 + mimeHexValue(value[index + 2]))
+            index = index + 3
+        } else {
+            buffer.appendByteValue(value[index])
+            index = index + 1
+        }
+    }
+    buffer.toText()
+}
+
+// A parameter, decoded: RFC 2231 `name*` and `name*0*` continuations first,
+// then a plain `name` (which may hold RFC 2047 words, as some mailers send).
+fun mimeParameter(parameters: array<MimeHeader>, name: string): string {
+    var charset = ""
+    var joined = ""
+    var found = false
+    var index = -1
+    while (index < 64) {
+        val key = if (index < 0) name else "$name*$index"
+        val encoded = mimeParameterRaw(parameters, "$key*")
+        val plain = if (index < 0) null else mimeParameterRaw(parameters, key)
+        if (encoded != null) {
+            var piece = encoded
+            if (!found) {
+                val first = textFindByte(piece, 39, 0, piece.size)
+                val second = if (first < 0) -1 else textFindByte(piece, 39, first + 1, piece.size)
+                if (second >= 0) {
+                    charset = piece.slice(0, first)
+                    piece = piece.slice(second + 1, piece.size)
+                }
+            }
+            joined = "$joined${mimePercentDecode(piece)}"
+            found = true
+            // `name*` is the whole value; `name*0*` starts continuations.
+            index = if (index < 0) 64 else index + 1
+        } else if (plain != null) {
+            joined = "$joined$plain"
+            found = true
+            index = index + 1
+        } else if (index < 0) index = 0
+        else index = 64
+    }
+    if (found) return mimeToUtf8(joined, charset)
+    val raw = mimeParameterRaw(parameters, name)
+    if (raw == null) "" else mimeDecodeHeader(raw)
+}
+
+fun mimeEntity(name: string): int =
+    if (name == "amp") 38 else if (name == "lt") 60 else if (name == "gt") 62
+    else if (name == "quot") 34 else if (name == "apos") 39 else if (name == "nbsp") 32
+    else if (name == "ndash") 8211 else if (name == "mdash") 8212
+    else if (name == "hellip") 8230 else if (name == "lsquo") 8216
+    else if (name == "rsquo") 8217 else if (name == "ldquo") 8220
+    else if (name == "rdquo") 8221 else if (name == "laquo") 171
+    else if (name == "raquo") 187 else if (name == "copy") 169
+    else if (name == "reg") 174 else if (name == "euro") 8364
+    else if (name == "middot") 183 else if (name == "bull") 8226
+    else if (name == "trade") 8482 else if (name == "zwnj") 0
+    else mimeLatin1Entity(name)
+
+// Named letters U+00C0..U+00FF (&eacute;, &Ccedil;, ...).
+fun mimeLatin1Entity(name: string): int {
+    val names = [
+        "Agrave", "Aacute", "Acirc", "Atilde", "Auml", "Aring", "AElig", "Ccedil",
+        "Egrave", "Eacute", "Ecirc", "Euml", "Igrave", "Iacute", "Icirc", "Iuml",
+        "ETH", "Ntilde", "Ograve", "Oacute", "Ocirc", "Otilde", "Ouml", "times",
+        "Oslash", "Ugrave", "Uacute", "Ucirc", "Uuml", "Yacute", "THORN", "szlig",
+        "agrave", "aacute", "acirc", "atilde", "auml", "aring", "aelig", "ccedil",
+        "egrave", "eacute", "ecirc", "euml", "igrave", "iacute", "icirc", "iuml",
+        "eth", "ntilde", "ograve", "oacute", "ocirc", "otilde", "ouml", "divide",
+        "oslash", "ugrave", "uacute", "ucirc", "uuml", "yacute", "thorn", "yuml"
+    ]
+    var index = 0
+    while (index < names.size) {
+        if (names[index] == name) return 192 + index
+        index = index + 1
+    }
+    -1
+}
+
+// Replaces HTML character references; unknown ones are kept as written.
+fun mimeHtmlEntities(value: string): string {
+    if (textFindByte(value, 38, 0, value.size) < 0) return value
+    val buffer = byteBuffer()
+    var index = 0
+    while (index < value.size) {
+        val ampersand = textFindByte(value, 38, index, value.size)
+        if (ampersand < 0) {
+            buffer.appendText(value.slice(index, value.size))
+            index = value.size
+        } else {
+            buffer.appendText(value.slice(index, ampersand))
+            var end = ampersand + 1
+            while (end < value.size && end < ampersand + 12 && value[end] != 59 &&
+                !mimeWhitespace(value[end]) && value[end] != 38) end = end + 1
+            var code = -1
+            if (end < value.size && value[end] == 59 && end > ampersand + 1) {
+                val name = value.slice(ampersand + 1, end)
+                if (name[0] == 35) {
+                    val hex = name.size > 1 && (name[1] == 120 || name[1] == 88)
+                    var digit = if (hex) 2 else 1
+                    var number = 0
+                    var valid = digit < name.size
+                    while (valid && digit < name.size) {
+                        val part = mimeHexValue(name[digit])
+                        valid = part >= 0 && (hex || part < 10) && number < 1114112
+                        number = number * (if (hex) 16 else 10) + part
+                        digit = digit + 1
+                    }
+                    if (valid && number > 0 && number < 1114112 && !(number >= 55296 && number < 57344))
+                        code = number
+                } else code = mimeEntity(name)
+            }
+            if (code < 0) {
+                buffer.appendByteValue(38)
+                index = ampersand + 1
+            } else {
+                if (code > 0) buffer.appendText(utf8Encode(code))
+                index = end + 1
+            }
+        }
+    }
+    buffer.toText()
+}
+
+class MimeHtmlText(
+    val buffer: ByteBuffer,
+    var pendingSpace: bool,
+    var newlines: int
+) {
+    fun text(value: string): void {
+        var index = 0
+        while (index < value.size) {
+            val byte = value[index]
+            if (mimeWhitespace(byte)) pendingSpace = true
+            else {
+                if (buffer.size() > 0 && newlines > 0) {
+                    buffer.appendText(if (newlines > 1) "\n\n" else "\n")
+                } else if (buffer.size() > 0 && pendingSpace) buffer.appendByteValue(32)
+                newlines = 0
+                pendingSpace = false
+                buffer.appendByteValue(byte)
+            }
+            index = index + 1
+        }
+        return
+    }
+    fun lineBreak(count: int): void {
+        if (count > newlines) newlines = count
+        pendingSpace = false
+        return
+    }
+}
+
+fun mimeHtmlTagName(html: string, begin: int, end: int): string {
+    var index = begin + 1
+    if (index < end && html[index] == 47) index = index + 1
+    val start = index
+    while (index < end && ((html[index] >= 65 && html[index] <= 90) ||
+        (html[index] >= 97 && html[index] <= 122) || (html[index] >= 48 && html[index] <= 57)))
+        index = index + 1
+    mimeLower(html.slice(start, index))
+}
+
+fun mimeHtmlAttribute(tag: string, name: string): string {
+    val lower = mimeLower(tag)
+    var position = 0
+    while (position < lower.size) {
+        val found = textFindSequence(lower, name, position, lower.size)
+        if (found < 0) return ""
+        var cursor = found + name.size
+        val boundary = found > 0 && mimeWhitespace(lower[found - 1])
+        while (cursor < lower.size && mimeWhitespace(lower[cursor])) cursor = cursor + 1
+        if (boundary && cursor < lower.size && lower[cursor] == 61) {
+            cursor = cursor + 1
+            while (cursor < lower.size && mimeWhitespace(lower[cursor])) cursor = cursor + 1
+            if (cursor < lower.size && (lower[cursor] == 34 || lower[cursor] == 39)) {
+                val quote = lower[cursor]
+                val close = textFindByte(tag, quote, cursor + 1, tag.size)
+                return if (close < 0) "" else mimeHtmlEntities(tag.slice(cursor + 1, close))
+            }
+            var close = cursor
+            while (close < tag.size && !mimeWhitespace(tag[close]) && tag[close] != 62) close = close + 1
+            return mimeHtmlEntities(tag.slice(cursor, close))
+        }
+        position = found + name.size
+    }
+    ""
+}
+
+fun mimeHtmlBlock(name: string): bool =
+    name == "p" || name == "div" || name == "tr" || name == "table" || name == "ul" ||
+    name == "ol" || name == "blockquote" || name == "h1" || name == "h2" ||
+    name == "h3" || name == "h4" || name == "h5" || name == "h6" || name == "hr" ||
+    name == "section" || name == "article" || name == "header" || name == "footer" ||
+    name == "pre" || name == "center" || name == "dl" || name == "dt" || name == "dd"
+
+// Where "</name" (any case) starts at or after `from`, or -1.
+fun mimeClosingTag(html: string, name: string, from: int): int {
+    val wanted = "</$name"
+    var position = textFindSequence(html, "</", from, html.size)
+    while (position >= 0 && position + wanted.size <= html.size) {
+        if (textAsciiEqualInsensitive(html.slice(position, position + wanted.size), wanted)) return position
+        position = textFindSequence(html, "</", position + 2, html.size)
+    }
+    -1
+}
+
+// Readable text from HTML: no tags, scripts or styles; block elements become
+// line breaks, list items "- " lines and links "text (url)".
+fun mimeHtmlToText(html: string): string {
+    val output = MimeHtmlText(byteBuffer(), false, 0)
+    var href = ""
+    var linkStart = 0
+    var position = 0
+    while (position < html.size) {
+        val open = textFindByte(html, 60, position, html.size)
+        val textEnd = if (open < 0) html.size else open
+        if (textEnd > position) output.text(mimeHtmlEntities(html.slice(position, textEnd)))
+        if (open < 0) {
+            position = html.size
+        } else if (open + 3 < html.size && html.slice(open, open + 4) == "<!--") {
+            val close = textFindSequence(html, "-->", open + 4, html.size)
+            position = if (close < 0) html.size else close + 3
+        } else {
+            val close = textFindByte(html, 62, open + 1, html.size)
+            val tagEnd = if (close < 0) html.size else close + 1
+            val name = mimeHtmlTagName(html, open, tagEnd)
+            val closing = open + 1 < html.size && html[open + 1] == 47
+            position = tagEnd
+            if (!closing && (name == "script" || name == "style" || name == "head" || name == "title")) {
+                val skip = mimeClosingTag(html, name, tagEnd)
+                if (skip < 0) position = html.size
+                else {
+                    val after = textFindByte(html, 62, skip, html.size)
+                    position = if (after < 0) html.size else after + 1
+                }
+            } else if (name == "br") output.lineBreak(1)
+            else if (name == "li") output.lineBreak(1)
+            else if (name == "td" || name == "th") {
+                if (closing) output.text(" ")
+            } else if (name == "p" || name == "h1" || name == "h2" || name == "h3" ||
+                name == "table" || name == "blockquote") output.lineBreak(2)
+            else if (mimeHtmlBlock(name)) output.lineBreak(1)
+            else if (name == "a" && !closing) {
+                href = mimeTrim(mimeHtmlAttribute(html.slice(open, tagEnd), "href"))
+                linkStart = output.buffer.size()
+            } else if (name == "a" && closing) {
+                if (href != "" && href[0] != 35) {
+                    val label = output.buffer.slice(linkStart, output.buffer.size()).toText()
+                    val target = if (href.size > 7 && mimeLower(href.slice(0, 7)) == "mailto:")
+                        href.slice(7, href.size) else href
+                    if (mimeTrim(label) != target) output.text(" ($href)")
+                }
+                href = ""
+            }
+            if (!closing && name == "li") output.text("- ")
+        }
+    }
+    output.buffer.toText()
+}
+
+fun mimeLineFeeds(value: string): string {
+    if (textFindByte(value, 13, 0, value.size) < 0) return value
+    val buffer = byteBuffer()
+    var index = 0
+    while (index < value.size) {
+        val carriage = textFindByte(value, 13, index, value.size)
+        if (carriage < 0) {
+            buffer.appendText(value.slice(index, value.size))
+            index = value.size
+        } else {
+            buffer.appendText(value.slice(index, carriage))
+            if (carriage + 1 >= value.size || value[carriage + 1] != 10) buffer.appendByteValue(10)
+            index = carriage + 1
+        }
+    }
+    buffer.toText()
+}
+
+fun mimeTransferDecode(body: string, encoding: string): string =
+    if (encoding == "base64") mimeBase64Decode(body)
+    else if (encoding == "quoted-printable") mimeQuotedPrintableDecode(body)
+    else body
+
+// The offset just past "--boundary" at a line start at or after `from`, or -1.
+fun mimeDelimiter(raw: string, boundary: string, from: int, end: int): int {
+    val marker = "--$boundary"
+    var position = from
+    while (position < end) {
+        var found = -1
+        if (position + marker.size <= end && (position == 0 || raw[position - 1] == 10) &&
+            textFindSequence(raw, marker, position, position + marker.size) == position) found = position
+        else {
+            val next = textFindSequence(raw, "\n$marker", position, end)
+            if (next >= 0) found = next + 1
+        }
+        if (found < 0) return -1
+        val after = found + marker.size
+        if (after >= end || raw[after] == 45 || mimeWhitespace(raw[after])) return after
+        position = after
+    }
+    -1
+}
+
+fun mimePart(
+    raw: string,
+    begin: int,
+    end: int,
+    depth: int,
+    var collector: MimeCollector
+): MimeText {
+    collector.parts = collector.parts + 1
+    val bodyBegin = mimeBodyBegin(raw, begin, end)
+    val headers = mimeParseHeaders(raw, begin, if (bodyBegin > begin) bodyBegin else begin)
+    val contentType = mimeParseContentType(mimeHeaderRaw(headers, "Content-Type"))
+    val mediaType = contentType.mediaType
+    val encoding = mimeLower(mimeTrim(mimeHeaderRaw(headers, "Content-Transfer-Encoding")))
+    val disposition = mimeParseContentType(mimeHeaderRaw(headers, "Content-Disposition"))
+    var name = mimeParameter(disposition.parameters, "filename")
+    if (name == "") name = mimeParameter(contentType.parameters, "name")
+    val boundary = mimeParameter(contentType.parameters, "boundary")
+
+    if (mediaType.startsWith("multipart/") && boundary != "" && depth < mimeMaximumDepth) {
+        val texts: array<MimeText> = []
+        var delimiter = mimeDelimiter(raw, boundary, bodyBegin, end)
+        while (delimiter >= 0 && collector.parts < mimeMaximumParts &&
+            !(delimiter + 1 < end && raw[delimiter] == 45 && raw[delimiter + 1] == 45)) {
+            val lineEnd = textFindByte(raw, 10, delimiter, end)
+            if (lineEnd < 0) delimiter = -1
+            else {
+                val partBegin = lineEnd + 1
+                val next = mimeDelimiter(raw, boundary, partBegin, end)
+                var partEnd = if (next < 0) end else next - boundary.size - 2
+                if (next >= 0 && partEnd > partBegin && raw[partEnd - 1] == 10) partEnd = partEnd - 1
+                if (next >= 0 && partEnd > partBegin && raw[partEnd - 1] == 13) partEnd = partEnd - 1
+                if (partEnd < partBegin) partEnd = partBegin
+                texts.append(mimePart(raw, partBegin, partEnd, depth + 1, collector))
+                delimiter = next
+            }
+        }
+        if (mediaType == "multipart/alternative") {
+            for (text in texts) if (!text.fromHtml && mimeTrim(text.text) != "") return text
+            for (text in texts) if (mimeTrim(text.text) != "") return text
+            return MimeText("", false)
+        }
+        val buffer = byteBuffer()
+        var fromHtml = false
+        for (text in texts) {
+            if (mimeTrim(text.text) != "") {
+                if (buffer.size() > 0) buffer.appendText("\n\n")
+                buffer.appendText(text.text)
+                if (text.fromHtml) fromHtml = true
+            }
+        }
+        return MimeText(buffer.toText(), fromHtml)
+    }
+
+    val body = raw.slice(bodyBegin, end)
+    val textual = mediaType == "text/plain" || mediaType == "text/html"
+    val attachment = disposition.mediaType == "attachment" || !textual ||
+        (name != "" && disposition.mediaType != "inline")
+    if (attachment) {
+        val size = if (encoding == "base64") mimeBase64DecodedSize(body) else body.size
+        if (collector.attachments.size < mimeMaximumParts)
+            collector.attachments.append(MimeAttachment(name, mediaType, size))
+        return MimeText("", false)
+    }
+    val decoded = mimeToUtf8(mimeTransferDecode(body, encoding),
+        mimeParameter(contentType.parameters, "charset"))
+    if (mediaType == "text/html") MimeText(mimeHtmlToText(decoded), true)
+    else MimeText(mimeLineFeeds(decoded), false)
+}
+
+// The first `maximum` bytes of UTF-8 `value`, not splitting a character.
+fun mimeUtf8Prefix(value: string, maximum: int): string {
+    if (value.size <= maximum) return value
+    var end = maximum
+    while (end > 0 && value[end] >= 128 && value[end] < 192) end = end - 1
+    value.slice(0, end)
+}
+
+// Parses a raw RFC 5322 message (CRLF or LF line endings). The text is at
+// most 1 MiB; `truncated` says when more was cut off.
+fun mimeParse(raw: string): MimeMessage {
+    val bodyBegin = mimeBodyBegin(raw, 0, raw.size)
+    val headers = mimeParseHeaders(raw, 0, bodyBegin)
+    var collector = MimeCollector([], 0)
+    val body = mimePart(raw, 0, raw.size, 0, collector)
+    val text = mimeTrim(body.text)
+    MimeMessage(
+        headers,
+        mimeHeader(headers, "From"),
+        mimeHeader(headers, "To"),
+        mimeHeader(headers, "Cc"),
+        mimeHeader(headers, "Subject"),
+        mimeHeader(headers, "Date"),
+        mimeTrim(mimeHeaderRaw(headers, "Message-ID")),
+        mimeTrim(mimeHeaderRaw(headers, "In-Reply-To")),
+        mimeTrim(mimeHeaderRaw(headers, "References")),
+        mimeUtf8Prefix(text, mimeMaximumText),
+        body.fromHtml,
+        text.size > mimeMaximumText,
+        collector.attachments
+    )
+}

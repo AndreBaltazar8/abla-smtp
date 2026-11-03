@@ -1,4 +1,6 @@
 import "smtp.ab"
+import "mime.ab"
+import "abla/text"
 
 class ImapConfig(
     val host: string,
@@ -206,3 +208,701 @@ fun imapMarkSeenResult(config: ImapConfig, uid: string): ImapActionResult {
 
 fun imapMarkSeen(config: ImapConfig, uid: string): bool =
     imapMarkSeenResult(config, uid).succeeded
+
+// Mailbox access for agents that read and file their own mail: list and
+// search a folder, fetch one message without marking it seen, set or clear
+// \Seen, and APPEND sent mail. Each call opens one certificate-verified
+// connection, does its work and logs out. Responses, lines, literals and
+// timeouts are bounded, and errors never include the credentials.
+
+class ImapResponse(
+    val complete: bool,
+    val status: string,
+    val contents: string,
+    val error: string
+)
+
+class ImapMessageSummary(
+    val uid: string,
+    val from: string,
+    val to: string,
+    val cc: string,
+    val subject: string,
+    val date: string,
+    val messageId: string,
+    val inReplyTo: string,
+    val references: string,
+    val seen: bool,
+    val size: int
+)
+
+class ImapListResult(
+    val succeeded: bool,
+    val messages: array<ImapMessageSummary>,
+    val matched: int,
+    val error: string
+)
+
+// Search criteria, all of which must match. `since` is YYYY-MM-DD (by the
+// server's internal date) and `afterUid` keeps only newer UIDs.
+class ImapQuery(
+    val unseen: bool = false,
+    val from: string = "",
+    val subject: string = "",
+    val since: string = "",
+    val text: string = "",
+    val afterUid: string = ""
+)
+
+class ImapMessage(
+    val found: bool,
+    val uid: string,
+    val raw: string,
+    val size: int,
+    val truncated: bool,
+    val seen: bool,
+    val error: string
+)
+
+class ImapAppendResult(
+    val succeeded: bool,
+    val uid: string,
+    val error: string
+)
+
+class ImapFetchItem(
+    val uid: string,
+    val flags: string,
+    val size: int,
+    val body: string
+)
+
+class ImapValue(
+    val text: string,
+    val end: int,
+    val valid: bool
+)
+
+val imapMaximumLine = 1048576
+val imapMaximumLimit = 200
+
+fun imapReadTimeout(configured: int): int =
+    if (configured < 1000) 1000 else if (configured > 60000) 60000 else configured
+
+fun imapConfigValid(config: ImapConfig): bool =
+    imapSafeCredential(config.username) && imapSafeCredential(config.password) &&
+    config.host != "" && !smtpContainsNewline(config.host) &&
+    config.port > 0 && config.port < 65536
+
+// Printable ASCII only; international folder names would need modified UTF-7.
+fun imapMailboxValid(mailbox: string): bool {
+    if (mailbox.size == 0 || mailbox.size > 255) return false
+    var index = 0
+    while (index < mailbox.size) {
+        if (mailbox[index] < 32 || mailbox[index] > 126) return false
+        index = index + 1
+    }
+    true
+}
+
+fun imapAsciiDigits(value: string, begin: int, end: int): int {
+    if (begin >= end || end - begin > 18) return -1
+    var result = 0
+    var index = begin
+    while (index < end) {
+        if (!smtpDigit(value[index])) return -1
+        result = result * 10 + value[index] - 48
+        index = index + 1
+    }
+    result
+}
+
+// The size of a "{n}" literal ending the line that ends at `newline`, or -1.
+fun imapLiteralBefore(text: string, begin: int, newline: int): int {
+    if (newline - 1 <= begin || text[newline - 1] != 125) return -1
+    var open = newline - 2
+    while (open > begin && newline - open < 22 && smtpDigit(text[open])) open = open - 1
+    if (text[open] != 123) return -1
+    imapAsciiDigits(text, open + 1, newline - 1)
+}
+
+fun imapStatusWord(line: string): string {
+    var end = 0
+    while (end < line.size && line[end] != 32 && line[end] != 13) end = end + 1
+    line.slice(0, end).uppercase()
+}
+
+// Reads until the line tagged `tag` (or, with `continuation`, a "+" line),
+// following literals so message text can never end the response early.
+fun imapReadResponse(
+    var connection: TlsConnection,
+    tag: string,
+    maximum: int,
+    continuation: bool = false
+): ImapResponse {
+    val buffer = byteBuffer()
+    val prefix = "$tag "
+    var carry = ""
+    var literal = 0
+    var lineStart = true
+    while (true) {
+        val chunk = connection.read(65536)
+        if (chunk.size == 0) return ImapResponse(false, "", "", "connection closed")
+        if (buffer.size() + chunk.size > maximum)
+            return ImapResponse(false, "", "", "response too large")
+        buffer.appendText(chunk)
+        val text = if (carry == "") chunk else "$carry$chunk"
+        carry = ""
+        var position = 0
+        while (position < text.size) {
+            if (literal > 0) {
+                val take = if (literal < text.size - position) literal else text.size - position
+                literal = literal - take
+                position = position + take
+            } else {
+                val newline = textFindSequence(text, "\r\n", position, text.size)
+                if (newline < 0) {
+                    carry = text.slice(position, text.size)
+                    position = text.size
+                } else {
+                    if (lineStart && newline - position >= prefix.size &&
+                        text.slice(position, position + prefix.size) == prefix) {
+                        val status = imapStatusWord(text.slice(position + prefix.size, newline))
+                        return ImapResponse(true, status, buffer.toText(), "")
+                    }
+                    if (continuation && lineStart && text[position] == 43)
+                        return ImapResponse(true, "+", buffer.toText(), "")
+                    val size = imapLiteralBefore(text, position, newline)
+                    if (size > maximum) return ImapResponse(false, "", "", "response too large")
+                    literal = if (size > 0) size else 0
+                    lineStart = size < 0
+                    position = newline + 2
+                }
+            }
+        }
+        if (carry.size > imapMaximumLine) return ImapResponse(false, "", "", "line too long")
+    }
+    ImapResponse(false, "", "", "unreachable")
+}
+
+// Sends a command made of text and literals, alternating: parts[0] is text,
+// parts[1] a literal, parts[2] text, ... Each literal waits for the server's
+// go-ahead.
+fun imapSend(
+    var connection: TlsConnection,
+    tag: string,
+    parts: array<string>,
+    maximum: int
+): ImapResponse {
+    var pending = "$tag "
+    var index = 0
+    while (index < parts.size) {
+        pending = "$pending${parts[index]}"
+        if (index + 1 < parts.size) {
+            pending = "$pending{${parts[index + 1].size}}\r\n"
+            if (connection.write(pending) != pending.size)
+                return ImapResponse(false, "", "", "write failed")
+            val ready = imapReadResponse(connection, tag, 65536, true)
+            if (!ready.complete) return ready
+            if (ready.status != "+") return ImapResponse(true, ready.status, ready.contents, "")
+            pending = parts[index + 1]
+            index = index + 2
+        } else index = index + 1
+    }
+    pending = "$pending\r\n"
+    if (connection.write(pending) != pending.size) ImapResponse(false, "", "", "write failed")
+    else imapReadResponse(connection, tag, maximum)
+}
+
+fun imapRun(var connection: TlsConnection, tag: string, command: string, maximum: int = 65536): ImapResponse =
+    imapSend(connection, tag, [command], maximum)
+
+fun imapOkay(response: ImapResponse): bool = response.complete && response.status == "OK"
+
+fun imapConnect(config: ImapConfig): TlsConnection = tlsConnect(
+    config.host, config.port, smtpConnectTimeout(config.timeoutMilliseconds),
+    imapReadTimeout(config.timeoutMilliseconds)
+)
+
+// Greeting, LOGIN and SELECT/EXAMINE. Returns "" or an error that never
+// includes the password.
+fun imapOpenMailbox(
+    var connection: TlsConnection,
+    config: ImapConfig,
+    mailbox: string,
+    readOnly: bool
+): string {
+    val greeting = connection.read(8192)
+    if (!imapContains(greeting, "* OK")) return "invalid greeting"
+    val login = imapRun(
+        connection, "A001",
+        "LOGIN ${imapQuote(config.username)} ${imapQuote(config.password)}"
+    )
+    if (!imapOkay(login)) return if (login.complete) "login failed" else "login failed: ${login.error}"
+    if (mailbox == "") return ""
+    val verb = if (readOnly) "EXAMINE" else "SELECT"
+    val selected = imapRun(connection, "A002", "$verb ${imapQuote(mailbox)}", 262144)
+    if (imapOkay(selected)) "" else "mailbox not found: $mailbox"
+}
+
+fun imapClose(var connection: TlsConnection): void {
+    imapRun(connection, "A099", "LOGOUT")
+    connection.close()
+    return
+}
+
+// Skips one response line, including any literals it carries.
+fun imapNextLine(text: string, position: int): int {
+    var cursor = position
+    while (cursor < text.size) {
+        val newline = textFindSequence(text, "\r\n", cursor, text.size)
+        if (newline < 0) return text.size
+        val size = imapLiteralBefore(text, cursor, newline)
+        if (size < 0) return newline + 2
+        cursor = newline + 2 + size
+    }
+    text.size
+}
+
+// One IMAP value at `position`: an atom, quoted string, literal or
+// parenthesized list (returned as written).
+fun imapParseValue(text: string, position: int, depth: int = 0): ImapValue {
+    if (position >= text.size || depth > 16) return ImapValue("", position, false)
+    val first = text[position]
+    if (first == 34) {
+        val buffer = byteBuffer()
+        var cursor = position + 1
+        while (cursor < text.size && text[cursor] != 34) {
+            if (text[cursor] == 92 && cursor + 1 < text.size) cursor = cursor + 1
+            buffer.appendByteValue(text[cursor])
+            cursor = cursor + 1
+        }
+        if (cursor >= text.size) return ImapValue("", cursor, false)
+        return ImapValue(buffer.toText(), cursor + 1, true)
+    }
+    if (first == 123) {
+        val close = textFindByte(text, 125, position, text.size)
+        if (close < 0) return ImapValue("", position, false)
+        val size = imapAsciiDigits(text, position + 1, close)
+        val begin = close + 3
+        if (size < 0 || begin > text.size || text.slice(close + 1, begin) != "\r\n" ||
+            begin + size > text.size) return ImapValue("", position, false)
+        return ImapValue(text.slice(begin, begin + size), begin + size, true)
+    }
+    if (first == 40) {
+        var cursor = position + 1
+        while (cursor < text.size && text[cursor] != 41) {
+            if (text[cursor] == 32) cursor = cursor + 1
+            else {
+                val item = imapParseValue(text, cursor, depth + 1)
+                if (!item.valid) return item
+                cursor = item.end
+            }
+        }
+        if (cursor >= text.size) return ImapValue("", cursor, false)
+        return ImapValue(text.slice(position, cursor + 1), cursor + 1, true)
+    }
+    var cursor = position
+    while (cursor < text.size && text[cursor] != 32 && text[cursor] != 41 &&
+        text[cursor] != 40 && text[cursor] != 13) cursor = cursor + 1
+    if (cursor == position) return ImapValue("", position, false)
+    val atom = text.slice(position, cursor)
+    ImapValue(if (atom.uppercase() == "NIL") "" else atom, cursor, true)
+}
+
+// The untagged FETCH responses: UID, FLAGS, RFC822.SIZE and one BODY[...].
+fun imapParseFetches(text: string): array<ImapFetchItem> {
+    val items: array<ImapFetchItem> = []
+    var position = 0
+    while (position < text.size) {
+        var cursor = position
+        var fetch = false
+        if (cursor + 2 < text.size && text[cursor] == 42 && text[cursor + 1] == 32) {
+            cursor = cursor + 2
+            while (cursor < text.size && smtpDigit(text[cursor])) cursor = cursor + 1
+            fetch = cursor + 8 <= text.size && text.slice(cursor, cursor + 8).uppercase() == " FETCH ("
+        }
+        if (!fetch) position = imapNextLine(text, position)
+        else {
+            cursor = cursor + 8
+            var uid = ""
+            var flags = ""
+            var size = 0
+            var body = ""
+            var valid = true
+            while (valid && cursor < text.size && text[cursor] != 41) {
+                if (text[cursor] == 32) cursor = cursor + 1
+                else {
+                    val keyStart = cursor
+                    while (cursor < text.size && text[cursor] != 32 && text[cursor] != 91) cursor = cursor + 1
+                    if (cursor < text.size && text[cursor] == 91) {
+                        val close = textFindByte(text, 93, cursor, text.size)
+                        cursor = if (close < 0) text.size else close + 1
+                        while (cursor < text.size && text[cursor] != 32) cursor = cursor + 1
+                    }
+                    val key = text.slice(keyStart, cursor).uppercase()
+                    val value = imapParseValue(text, cursor + 1)
+                    valid = value.valid
+                    cursor = value.end
+                    if (key == "UID") uid = value.text
+                    else if (key == "FLAGS") flags = value.text
+                    else if (key == "RFC822.SIZE") size = imapAsciiDigits(value.text, 0, value.text.size)
+                    else if (key.startsWith("BODY[")) body = value.text
+                }
+            }
+            if (valid && imapUidValid(uid)) items.append(ImapFetchItem(uid, flags, size, body))
+            position = if (valid) imapNextLine(text, cursor) else text.size
+        }
+    }
+    items
+}
+
+fun imapFlagged(flags: string, flag: string): bool {
+    val upper = flags.uppercase()
+    val wanted = flag.uppercase()
+    var position = textFindSequence(upper, wanted, 0, upper.size)
+    while (position >= 0) {
+        val after = position + wanted.size
+        if (after >= upper.size || upper[after] == 32 || upper[after] == 41) return true
+        position = textFindSequence(upper, wanted, after, upper.size)
+    }
+    false
+}
+
+// The UIDs of every "* SEARCH" line.
+fun imapSearchUids(text: string): array<int> {
+    val uids: array<int> = []
+    var position = 0
+    while (position < text.size) {
+        val next = imapNextLine(text, position)
+        if (next - position > 8 && text.slice(position, position + 8).uppercase() == "* SEARCH") {
+            var cursor = position + 8
+            while (cursor < next) {
+                while (cursor < next && !smtpDigit(text[cursor])) cursor = cursor + 1
+                val begin = cursor
+                while (cursor < next && smtpDigit(text[cursor])) cursor = cursor + 1
+                val uid = imapAsciiDigits(text, begin, cursor)
+                if (uid > 0) uids.append(uid)
+            }
+        }
+        position = next
+    }
+    uids
+}
+
+fun imapSortInts(values: array<int>): array<int> {
+    val sorted: array<int> = []
+    for (value in values) sorted.append(value)
+    val scratch: array<int> = []
+    var width = 1
+    while (width < sorted.size) {
+        scratch.truncate(0)
+        var begin = 0
+        while (begin < sorted.size) {
+            val middle = if (begin + width < sorted.size) begin + width else sorted.size
+            val end = if (begin + 2 * width < sorted.size) begin + 2 * width else sorted.size
+            var left = begin
+            var right = middle
+            while (left < middle || right < end) {
+                if (right >= end || (left < middle && sorted[left] <= sorted[right])) {
+                    scratch.append(sorted[left])
+                    left = left + 1
+                } else {
+                    scratch.append(sorted[right])
+                    right = right + 1
+                }
+            }
+            begin = end
+        }
+        var index = 0
+        while (index < scratch.size) {
+            sorted[index] = scratch[index]
+            index = index + 1
+        }
+        width = width * 2
+    }
+    sorted
+}
+
+fun imapAsciiPrintable(value: string): bool {
+    var index = 0
+    while (index < value.size) {
+        if (value[index] < 32 || value[index] > 126) return false
+        index = index + 1
+    }
+    true
+}
+
+// YYYY-MM-DD as IMAP's d-Mon-yyyy, or "" when invalid.
+fun imapSearchDate(value: string): string {
+    if (value.size != 10 || value[4] != 45 || value[7] != 45) return ""
+    val year = imapAsciiDigits(value, 0, 4)
+    val month = imapAsciiDigits(value, 5, 7)
+    val day = imapAsciiDigits(value, 8, 10)
+    if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31) return ""
+    val months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    "$day-${months[month - 1]}-$year"
+}
+
+fun imapQueryValid(query: ImapQuery): bool =
+    query.from.size <= 1024 && query.subject.size <= 1024 && query.text.size <= 1024 &&
+    !smtpContainsNewline(query.from) && !smtpContainsNewline(query.subject) &&
+    !smtpContainsNewline(query.text) &&
+    (query.since == "" || imapSearchDate(query.since) != "") &&
+    (query.afterUid == "" || imapUidValid(query.afterUid))
+
+// The UID SEARCH command as text/literal parts (see imapSend). Non-ASCII
+// terms go as UTF-8 literals.
+fun imapSearchParts(query: ImapQuery): array<string> {
+    val parts: array<string> = []
+    val international = !imapAsciiPrintable(query.from) ||
+        !imapAsciiPrintable(query.subject) || !imapAsciiPrintable(query.text)
+    var text = if (international) "UID SEARCH CHARSET UTF-8" else "UID SEARCH"
+    var criteria = 0
+    if (query.afterUid != "") {
+        text = "$text UID ${imapAsciiDigits(query.afterUid, 0, query.afterUid.size) + 1}:*"
+        criteria = criteria + 1
+    }
+    if (query.unseen) {
+        text = "$text UNSEEN"
+        criteria = criteria + 1
+    }
+    if (query.since != "") {
+        text = "$text SINCE ${imapSearchDate(query.since)}"
+        criteria = criteria + 1
+    }
+    val keys = ["FROM", "SUBJECT", "TEXT"]
+    val values = [query.from, query.subject, query.text]
+    var index = 0
+    while (index < keys.size) {
+        if (values[index] != "") {
+            if (imapAsciiPrintable(values[index])) text = "$text ${keys[index]} ${imapQuote(values[index])}"
+            else {
+                parts.append("$text ${keys[index]} ")
+                parts.append(values[index])
+                text = ""
+            }
+            criteria = criteria + 1
+        }
+        index = index + 1
+    }
+    if (criteria == 0) text = "$text ALL"
+    parts.append(text)
+    parts
+}
+
+fun imapListFailed(error: string): ImapListResult = ImapListResult(false, [], 0, error)
+
+// Messages in `mailbox` matching `query`, newest (highest UID) first, at most
+// `limit` (1-200). `matched` counts every match, so callers can page with
+// afterUid or narrow the search.
+fun imapSearchMessages(
+    config: ImapConfig,
+    mailbox: string,
+    query: ImapQuery,
+    limit: int = 20
+): ImapListResult {
+    if (!imapConfigValid(config)) return imapListFailed("invalid configuration")
+    if (!imapMailboxValid(mailbox)) return imapListFailed("invalid mailbox")
+    if (!imapQueryValid(query)) return imapListFailed("invalid search")
+    if (limit < 1 || limit > imapMaximumLimit) return imapListFailed("invalid limit")
+    var connection = imapConnect(config)
+    if (connection.handle < 0) return imapListFailed(tlsLastError())
+    var error = imapOpenMailbox(connection, config, mailbox, true)
+    val messages: array<ImapMessageSummary> = []
+    var matched = 0
+    if (error == "") {
+        val searched = imapSend(connection, "A003", imapSearchParts(query), 4194304)
+        if (!imapOkay(searched)) error = if (searched.complete) "search failed" else "search failed: ${searched.error}"
+        else {
+            // "UID n:*" always matches the newest message, even below n.
+            val after = if (query.afterUid == "") 0 else imapAsciiDigits(query.afterUid, 0, query.afterUid.size)
+            val found: array<int> = []
+            for (uid in imapSearchUids(searched.contents)) if (uid > after) found.append(uid)
+            val sorted = imapSortInts(found)
+            matched = sorted.size
+            var set = ""
+            var index = sorted.size - 1
+            while (index >= 0 && sorted.size - index <= limit) {
+                set = if (set == "") "${sorted[index]}" else "$set,${sorted[index]}"
+                index = index - 1
+            }
+            if (set != "") {
+                val fetched = imapRun(
+                    connection, "A004",
+                    "UID FETCH $set (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS " +
+                        "(FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])",
+                    8388608
+                )
+                if (!imapOkay(fetched)) error = if (fetched.complete) "fetch failed" else "fetch failed: ${fetched.error}"
+                else {
+                    val items = imapParseFetches(fetched.contents)
+                    index = sorted.size - 1
+                    while (index >= 0 && sorted.size - index <= limit) {
+                        val uid = "${sorted[index]}"
+                        for (item in items) {
+                            if (item.uid == uid) {
+                                val headers = mimeParseHeaders(item.body, 0, item.body.size)
+                                messages.append(ImapMessageSummary(
+                                    uid,
+                                    mimeHeader(headers, "From"),
+                                    mimeHeader(headers, "To"),
+                                    mimeHeader(headers, "Cc"),
+                                    mimeHeader(headers, "Subject"),
+                                    mimeHeader(headers, "Date"),
+                                    mimeTrim(mimeHeaderRaw(headers, "Message-ID")),
+                                    mimeTrim(mimeHeaderRaw(headers, "In-Reply-To")),
+                                    mimeTrim(mimeHeaderRaw(headers, "References")),
+                                    imapFlagged(item.flags, "\\Seen"),
+                                    item.size
+                                ))
+                            }
+                        }
+                        index = index - 1
+                    }
+                }
+            }
+        }
+    }
+    imapClose(connection)
+    if (error == "") ImapListResult(true, messages, matched, "") else imapListFailed(error)
+}
+
+// The newest messages in `mailbox`, optionally only those after `afterUid`.
+fun imapListMessages(
+    config: ImapConfig,
+    mailbox: string,
+    limit: int = 20,
+    afterUid: string = ""
+): ImapListResult = imapSearchMessages(config, mailbox, ImapQuery(afterUid = afterUid), limit)
+
+fun imapMessageFailed(uid: string, error: string): ImapMessage =
+    ImapMessage(false, uid, "", 0, false, false, error)
+
+// One message by UID, without marking it seen. Messages larger than
+// `maximumBytes` (1 KiB-32 MiB) come back cut short with `truncated` set;
+// text parts usually come first, so mimeParse can still read them.
+fun imapFetchMessage(
+    config: ImapConfig,
+    mailbox: string,
+    uid: string,
+    maximumBytes: int = 8388608
+): ImapMessage {
+    if (!imapConfigValid(config)) return imapMessageFailed(uid, "invalid configuration")
+    if (!imapMailboxValid(mailbox)) return imapMessageFailed(uid, "invalid mailbox")
+    if (!imapUidValid(uid)) return imapMessageFailed(uid, "invalid uid")
+    if (maximumBytes < 1024 || maximumBytes > 33554432) return imapMessageFailed(uid, "invalid maximum")
+    var connection = imapConnect(config)
+    if (connection.handle < 0) return imapMessageFailed(uid, tlsLastError())
+    var error = imapOpenMailbox(connection, config, mailbox, true)
+    var result = imapMessageFailed(uid, "")
+    if (error == "") {
+        val fetched = imapRun(
+            connection, "A003",
+            "UID FETCH $uid (UID FLAGS RFC822.SIZE BODY.PEEK[]<0.$maximumBytes>)",
+            maximumBytes + 65536
+        )
+        if (!imapOkay(fetched)) error = if (fetched.complete) "fetch failed" else "fetch failed: ${fetched.error}"
+        else {
+            for (item in imapParseFetches(fetched.contents)) {
+                if (item.uid == uid) result = ImapMessage(
+                    true, uid, item.body, item.size, item.size > item.body.size,
+                    imapFlagged(item.flags, "\\Seen"), ""
+                )
+            }
+            if (!result.found) error = "message not found"
+        }
+    }
+    imapClose(connection)
+    if (error == "") result else imapMessageFailed(uid, error)
+}
+
+// Sets or clears \Seen on one message.
+fun imapSetSeen(
+    config: ImapConfig,
+    mailbox: string,
+    uid: string,
+    seen: bool
+): ImapActionResult {
+    if (!imapConfigValid(config)) return ImapActionResult(false, "invalid configuration")
+    if (!imapMailboxValid(mailbox)) return ImapActionResult(false, "invalid mailbox")
+    if (!imapUidValid(uid)) return ImapActionResult(false, "invalid uid")
+    var connection = imapConnect(config)
+    if (connection.handle < 0) return ImapActionResult(false, tlsLastError())
+    var error = imapOpenMailbox(connection, config, mailbox, false)
+    if (error == "") {
+        // STORE succeeds silently for a UID that doesn't exist.
+        val searched = imapRun(connection, "A003", "UID SEARCH UID $uid")
+        val target = imapAsciiDigits(uid, 0, uid.size)
+        var exists = false
+        for (found in imapSearchUids(searched.contents)) if (found == target) exists = true
+        if (!imapOkay(searched)) error = "search failed"
+        else if (!exists) error = "message not found"
+        else {
+            val operation = if (seen) "+FLAGS.SILENT" else "-FLAGS.SILENT"
+            val stored = imapRun(connection, "A004", "UID STORE $uid $operation (\\Seen)")
+            if (!imapOkay(stored)) error = if (seen) "mark seen failed" else "mark unseen failed"
+        }
+    }
+    imapClose(connection)
+    ImapActionResult(error == "", error)
+}
+
+// CRLF line endings, as IMAP requires.
+fun imapCrlf(value: string): string {
+    val buffer = byteBuffer()
+    var index = 0
+    while (index < value.size) {
+        val newline = textFindByte(value, 10, index, value.size)
+        if (newline < 0) {
+            buffer.appendText(value.slice(index, value.size))
+            index = value.size
+        } else {
+            val end = if (newline > index && value[newline - 1] == 13) newline - 1 else newline
+            buffer.appendText(value.slice(index, end))
+            buffer.appendText("\r\n")
+            index = newline + 1
+        }
+    }
+    buffer.toText()
+}
+
+// Stores a raw RFC 5322 message (at most 32 MiB) in `mailbox`, for example
+// smtpRenderMessage's output in "Sent". `uid` is set when the server reports it.
+fun imapAppend(
+    config: ImapConfig,
+    mailbox: string,
+    raw: string,
+    seen: bool = true
+): ImapAppendResult {
+    if (!imapConfigValid(config)) return ImapAppendResult(false, "", "invalid configuration")
+    if (!imapMailboxValid(mailbox)) return ImapAppendResult(false, "", "invalid mailbox")
+    if (raw.size == 0 || raw.size > 33554432 || textFindByte(raw, 0, 0, raw.size) >= 0)
+        return ImapAppendResult(false, "", "invalid message")
+    var connection = imapConnect(config)
+    if (connection.handle < 0) return ImapAppendResult(false, "", tlsLastError())
+    var error = imapOpenMailbox(connection, config, "", false)
+    var uid = ""
+    if (error == "") {
+        val flags = if (seen) " (\\Seen)" else ""
+        val appended = imapSend(
+            connection, "A003", ["APPEND ${imapQuote(mailbox)}$flags ", imapCrlf(raw), ""], 65536
+        )
+        if (!imapOkay(appended)) error = if (appended.complete) "append failed" else "append failed: ${appended.error}"
+        else {
+            // "A003 OK [APPENDUID <validity> <uid>] ..."
+            val marker = textFindSequence(appended.contents, "[APPENDUID ", 0, appended.contents.size)
+            if (marker >= 0) {
+                var cursor = marker + 11
+                while (cursor < appended.contents.size && smtpDigit(appended.contents[cursor])) cursor = cursor + 1
+                val begin = cursor + 1
+                var end = begin
+                while (end < appended.contents.size && smtpDigit(appended.contents[end])) end = end + 1
+                if (cursor < appended.contents.size && appended.contents[cursor] == 32 && end > begin)
+                    uid = appended.contents.slice(begin, end)
+            }
+        }
+    }
+    imapClose(connection)
+    ImapAppendResult(error == "", uid, error)
+}

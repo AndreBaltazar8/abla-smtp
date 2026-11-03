@@ -1,0 +1,144 @@
+import "../src/smtp.ab"
+import "../src/imap.ab"
+import "abla/io"
+
+var failures = 0
+
+fun check(name: string, passed: bool): void {
+    if (!passed) {
+        println("FAIL $name")
+        failures = failures + 1
+    }
+    return
+}
+
+fun mimeTests(): void {
+    val raw = "From: =?ISO-8859-1?Q?Andr=E9?= <a@x.pt>\r\n" +
+        "To: qa1@example.com\r\nCc: =?UTF-8?B?Sm/Do28=?= <j@x.pt>\r\n" +
+        "Subject: =?UTF-8?B?T2zDoQ==?=\r\n =?UTF-8?Q?_mundo?= now\r\n" +
+        "Message-ID: <m1@x.pt>\r\nIn-Reply-To: <m0@x.pt>\r\nReferences: <a@x.pt>\r\n <m0@x.pt>\r\n" +
+        "Content-Type: multipart/mixed; boundary=\"b1\"\r\n\r\npreamble\r\n--b1\r\n" +
+        "Content-Type: multipart/alternative; boundary=b2\r\n\r\n--b2\r\n" +
+        "Content-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n" +
+        "Ol=E1 Andr=E9, uma linha que =\r\ncontinua.\r\n=3D fim\r\n--b2\r\nContent-Type: text/html\r\n\r\n<p>html</p>\r\n--b2--\r\n" +
+        "--b1\r\nContent-Type: application/pdf; name=\"x.pdf\"\r\n" +
+        "Content-Disposition: attachment; filename*=UTF-8''fatura%20%C3%A9.pdf\r\n" +
+        "Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8gd29y\r\nbGQ=\r\n" +
+        "--b1\r\nContent-Type: image/png\r\nContent-Disposition: inline;\r\n filename*0=\"lo\"; filename*1=\"go.png\"\r\n\r\nxyz\r\n--b1--\r\n"
+    val message = mimeParse(raw)
+    check("from", message.from == "André <a@x.pt>")
+    check("cc", message.cc == "João <j@x.pt>")
+    check("subject joins encoded words", message.subject == "Olá mundo now")
+    check("message-id", message.messageId == "<m1@x.pt>")
+    check("in-reply-to", message.inReplyTo == "<m0@x.pt>")
+    check("references unfolded", message.references == "<a@x.pt> <m0@x.pt>")
+    check("prefers plain text", message.text == "Olá André, uma linha que continua.\n= fim")
+    check("not from html", !message.textFromHtml)
+    check("two attachments", message.attachments.size == 2)
+    if (message.attachments.size == 2) {
+        check("rfc2231 name", message.attachments[0].name == "fatura é.pdf")
+        check("attachment type", message.attachments[0].contentType == "application/pdf")
+        check("decoded size", message.attachments[0].size == 11)
+        check("continued name", message.attachments[1].name == "logo.png")
+    }
+
+    val html = mimeParse("Subject: x\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: base64\n\n" +
+        base64Encode("<html><head><title>T</title><style>p{}</style></head><body><p>Hello&nbsp;<b>there</b> &amp; you</p>" +
+            "<ul><li>one</li><li>two</li></ul><a href=\"https://x.pt/c?a=1&amp;b=2\">Confirm</a><br>caf&eacute; &#233;&#x41;" +
+            "<SCRIPT>a</b>(1)</Script ><a href=\"mailto:a@x.pt\">a@x.pt</a></body></html>"))
+    check("html to text", html.text == "Hello there & you\n\n- one\n- two\nConfirm (https://x.pt/c?a=1&b=2)\ncafé éAa@x.pt")
+    check("from html", html.textFromHtml)
+    check("html subject with lf headers", html.subject == "x")
+
+    val simple = mimeParse("Subject: plain\r\n\r\nline one\r\nline two\r\n")
+    check("default text/plain", simple.text == "line one\nline two")
+    check("no attachments", simple.attachments.size == 0)
+    check("latin-1 raw header", mimeDecodeHeader("Caf${byteEncode(233)}") == "Café")
+    check("cp1252 quotes", mimeToUtf8(byteEncode(147), "windows-1252") == "“")
+    check("broken encoded word kept", mimeDecodeHeader("=?bad") == "=?bad")
+    check("encoded and plain spacing", mimeDecodeHeader("=?UTF-8?Q?a?= b =?UTF-8?Q?c?=") == "a b c")
+    check("qp header underscore", mimeQuotedPrintableDecode("a_b=20c", true) == "a b c")
+    check("qp keeps malformed", mimeQuotedPrintableDecode("=ZZ=4") == "=ZZ=4")
+    check("base64 without padding", mimeBase64Decode("T2zD\noQ") == "Olá")
+    check("unterminated multipart", mimeParse("Content-Type: multipart/mixed; boundary=z\n\n--z\n\nhi").text == "hi")
+}
+
+fun imapTests(): void {
+    val response = "* 2 FETCH (UID 41 FLAGS (\\Seen \\Answered) RFC822.SIZE 120 BODY[] {22}\r\n" +
+        "x\r\nA003 OK fake\r\nend\r\n)\r\n* 3 EXISTS\r\n" +
+        "* 3 FETCH (FLAGS () UID 42 BODY[HEADER.FIELDS (FROM SUBJECT)] {15}\r\nSubject: hi\r\n\r\n)\r\nA003 OK done\r\n"
+    val items = imapParseFetches(response)
+    check("two fetches", items.size == 2)
+    if (items.size == 2) {
+        check("literal body", items[0].body == "x\r\nA003 OK fake\r\nend\r\n")
+        check("uid", items[0].uid == "41" && items[1].uid == "42")
+        check("size", items[0].size == 120)
+        check("seen flag", imapFlagged(items[0].flags, "\\Seen") && !imapFlagged(items[1].flags, "\\Seen"))
+        check("header fields body", items[1].body == "Subject: hi\r\n\r\n")
+    }
+    check("not a prefix flag", !imapFlagged("(\\SeenX)", "\\Seen"))
+    check("literal marker", imapLiteralBefore("BODY[] {22}\r\n", 0, 11) == 22)
+    check("no literal marker", imapLiteralBefore("A OK done\r\n", 0, 9) == -1)
+    check("search uids", imapSearchUids("* SEARCH 5 3 10\r\nA003 OK\r\n").size == 3)
+    val sorted = imapSortInts([5, 3, 10, 1, 7, 2])
+    check("sorted", sorted.size == 6 && sorted[0] == 1 && sorted[2] == 3 && sorted[5] == 10)
+    check("search date", imapSearchDate("2026-11-03") == "3-Nov-2026")
+    check("bad search date", imapSearchDate("2026-13-03") == "" && imapSearchDate("3-Nov-2026") == "")
+    val all = imapSearchParts(ImapQuery())
+    check("search all", all.size == 1 && all[0] == "UID SEARCH ALL")
+    val ascii = imapSearchParts(ImapQuery(unseen = true, from = "qa2@x", since = "2026-01-05", afterUid = "9"))
+    check("search ascii", ascii.size == 1 &&
+        ascii[0] == "UID SEARCH UID 10:* UNSEEN SINCE 5-Jan-2026 FROM \"qa2@x\"")
+    val international = imapSearchParts(ImapQuery(subject = "Olá", text = "x\"y"))
+    check("search literal", international.size == 3 &&
+        international[0] == "UID SEARCH CHARSET UTF-8 SUBJECT " && international[1] == "Olá" &&
+        international[2] == " TEXT \"x\\\"y\"")
+    check("query rejects newline", !imapQueryValid(ImapQuery(from = "a\r\nA1 LOGOUT")))
+    check("query rejects uid", !imapQueryValid(ImapQuery(afterUid = "1:*")))
+    check("mailbox", imapMailboxValid("Sent") && !imapMailboxValid("") && !imapMailboxValid("a\r\nb"))
+    check("crlf", imapCrlf("a\nb\r\nc") == "a\r\nb\r\nc")
+    val quoted = imapParseValue("\"a \\\"b\\\"\" rest", 0)
+    check("quoted value", quoted.valid && quoted.text == "a \"b\"" && quoted.end == 9)
+    check("nil value", imapParseValue("NIL)", 0).text == "")
+    check("short literal invalid", !imapParseValue("{10}\r\nabc", 0).valid)
+}
+
+fun smtpTests(): void {
+    val reply = SmtpMessage(
+        "qa1@myupmonitor.com", "qa1@myupmonitor.com", "QA One",
+        "qa2@myupmonitor.com", "", "Re: Olá",
+        "Obrigado.\n\n> antes", "",
+        "Tue, 03 Nov 2026 12:00:00 +0000", "r1@myupmonitor.com", "", "", "",
+        inReplyTo = "<m0@x.pt>", references = "<a@x.pt> m0@x.pt",
+        extraTo = ["qa3@myupmonitor.com"], cc = ["qa1@myupmonitor.com"]
+    )
+    val rendered = smtpRenderMessage(reply)
+    check("reply renders", rendered != "")
+    check("reply in-reply-to", imapContains(rendered, "In-Reply-To: <m0@x.pt>\r\n"))
+    check("reply references", imapContains(rendered, "References: <a@x.pt>\r\n <m0@x.pt>\r\n"))
+    check("extra to", imapContains(rendered, "To: <qa2@myupmonitor.com>,\r\n <qa3@myupmonitor.com>\r\n"))
+    check("cc", imapContains(rendered, "Cc: <qa1@myupmonitor.com>\r\n"))
+    check("text only", !imapContains(rendered, "multipart") && !imapContains(rendered, "text/html"))
+    check("recipients", smtpRecipients(reply).size == 3)
+    val parsed = mimeParse(rendered)
+    check("round trip text", parsed.text == "Obrigado.\n\n> antes")
+    check("round trip subject", parsed.subject == "Re: Olá")
+    check("round trip to", parsed.to == "<qa2@myupmonitor.com>, <qa3@myupmonitor.com>")
+    check("bad cc rejected", smtpRenderMessage(SmtpMessage(
+        "a@x.pt", "a@x.pt", "", "b@x.pt", "", "s", "t", "", "d", "id@x", "", "", "",
+        cc = ["c@x.pt>\r\nBcc: d@x.pt"]
+    )) == "")
+    check("bad reference rejected", smtpRenderMessage(SmtpMessage(
+        "a@x.pt", "a@x.pt", "", "b@x.pt", "", "s", "t", "", "d", "id@x", "", "", "",
+        references = "<a@x>\r\nBcc: d@x.pt"
+    )) == "")
+    check("reference needs @", smtpMessageIds("<a@x> nonsense") == "")
+}
+
+fun main: int {
+    mimeTests()
+    imapTests()
+    smtpTests()
+    if (failures == 0) println("mail tests passed")
+    failures
+}

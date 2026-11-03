@@ -1,0 +1,166 @@
+// Live check against real mailboxes; not part of `make test`. Sends only
+// between the three test accounts named in the environment:
+//   MAIL_HOST, MAIL_TOKEN (unique per run), QA1/QA2/QA3 (addresses) and
+//   QA1_PASSWORD/QA2_PASSWORD/QA3_PASSWORD. MAIL_FIXTURE_SUBJECT optionally
+//   names a message already in QA2's INBOX to parse (attachments, HTML).
+import "../src/smtp.ab"
+import "../src/imap.ab"
+import "abla/io"
+import "abla/sys/linux/process"
+
+var failures = 0
+
+fun check(name: string, passed: bool, detail: string = ""): void {
+    if (!passed) {
+        println("FAIL $name $detail")
+        failures = failures + 1
+    } else println("ok   $name")
+    return
+}
+
+fun environment(name: string): string = linuxEnvironment(name).value
+
+fun imapFor(address: string, password: string): ImapConfig =
+    ImapConfig(environment("MAIL_HOST"), 993, address, password, 10000)
+
+fun smtpFor(address: string, password: string): SmtpConfig =
+    SmtpConfig(environment("MAIL_HOST"), 465, address, password, "localhost", 10000)
+
+// Polls `mailbox` until a message with `subject` arrives (about 60 seconds).
+fun waitFor(config: ImapConfig, mailbox: string, subject: string): ImapListResult {
+    var attempt = 0
+    var result = imapSearchMessages(config, mailbox, ImapQuery(subject = subject), 5)
+    while (result.succeeded && result.messages.size == 0 && attempt < 30) {
+        linuxSleep(2000)
+        result = imapSearchMessages(config, mailbox, ImapQuery(subject = subject), 5)
+        attempt = attempt + 1
+    }
+    result
+}
+
+fun main: int {
+    val token = environment("MAIL_TOKEN")
+    val qa1 = environment("QA1")
+    val qa2 = environment("QA2")
+    val qa3 = environment("QA3")
+    val password1 = environment("QA1_PASSWORD")
+    val password2 = environment("QA2_PASSWORD")
+    val password3 = environment("QA3_PASSWORD")
+    if (token == "" || qa1 == "" || qa2 == "" || qa3 == "" || password1 == "") {
+        println("missing environment")
+        return 2
+    }
+    val imap1 = imapFor(qa1, password1)
+    val imap2 = imapFor(qa2, password2)
+    val imap3 = imapFor(qa3, password3)
+    val domain = qa1.slice(textFindByte(qa1, 64, 0, qa1.size) + 1, qa1.size)
+
+    // qa1 -> qa2, cc qa3, then filed in qa1's Sent.
+    val subject = "Olá $token"
+    val original = SmtpMessage(
+        qa1, qa1, "QA Um", qa2, "", subject,
+        "Olá QA dois,\n\nIsto é um teste ($token).\n.linha com ponto", "",
+        "Tue, 03 Nov 2026 12:00:00 +0000", "orig.$token@$domain", "", "", "",
+        cc = [qa3]
+    )
+    val sent = smtpSend(smtpFor(qa1, password1), original)
+    check("smtp send with cc", sent.succeeded, sent.detail)
+    val filed = imapAppend(imap1, "Sent", smtpRenderMessage(original))
+    check("append to Sent", filed.succeeded && filed.uid != "", filed.error)
+    val inSent = imapSearchMessages(imap1, "Sent", ImapQuery(subject = token), 5)
+    check("appended message in Sent", inSent.succeeded && inSent.messages.size == 1 &&
+        inSent.messages[0].uid == filed.uid && inSent.messages[0].seen, inSent.error)
+
+    val arrived = waitFor(imap2, "INBOX", subject)
+    check("arrived for qa2", arrived.succeeded && arrived.messages.size == 1, arrived.error)
+    if (arrived.messages.size != 1) return 1
+    val summary = arrived.messages[0]
+    check("summary subject", summary.subject == subject, summary.subject)
+    check("summary from", imapContains(summary.from, qa1), summary.from)
+    check("summary cc", imapContains(summary.cc, qa3), summary.cc)
+    check("summary message-id", summary.messageId == "<orig.$token@$domain>", summary.messageId)
+    check("summary unseen", !summary.seen)
+    check("summary size", summary.size > 100)
+
+    val listed = imapListMessages(imap2, "INBOX", 3)
+    check("list newest first", listed.succeeded && listed.messages.size >= 1 &&
+        listed.messages[0].uid == summary.uid, listed.error)
+    var ordered = true
+    var index = 1
+    while (index < listed.messages.size) {
+        val previous = imapAsciiDigits(listed.messages[index - 1].uid, 0, listed.messages[index - 1].uid.size)
+        val current = imapAsciiDigits(listed.messages[index].uid, 0, listed.messages[index].uid.size)
+        if (current >= previous) ordered = false
+        index = index + 1
+    }
+    check("list descending uids", ordered && listed.messages.size <= 3 && listed.matched >= listed.messages.size)
+    val after = imapListMessages(imap2, "INBOX", 10, summary.uid)
+    check("list after newest is empty", after.succeeded && after.messages.size == 0 && after.matched == 0, after.error)
+
+    val fetched = imapFetchMessage(imap2, "INBOX", summary.uid)
+    check("fetch by uid", fetched.found && fetched.raw.size == fetched.size && !fetched.truncated, fetched.error)
+    val parsed = mimeParse(fetched.raw)
+    check("parsed text", parsed.text == "Olá QA dois,\n\nIsto é um teste ($token).\n.linha com ponto", parsed.text)
+    check("parsed subject", parsed.subject == subject)
+    val still = imapSearchMessages(imap2, "INBOX", ImapQuery(subject = subject), 5)
+    check("fetch left it unseen", still.messages.size == 1 && !still.messages[0].seen)
+    val partial = imapFetchMessage(imap2, "INBOX", summary.uid, 1024)
+    check("bounded fetch truncates", partial.found && partial.raw.size == 1024 && partial.truncated)
+
+    check("set seen", imapSetSeen(imap2, "INBOX", summary.uid, true).succeeded)
+    val seen = imapSearchMessages(imap2, "INBOX", ImapQuery(subject = subject), 5)
+    check("now seen", seen.messages.size == 1 && seen.messages[0].seen)
+    val unseenSearch = imapSearchMessages(imap2, "INBOX", ImapQuery(unseen = true, subject = subject), 5)
+    check("unseen search excludes it", unseenSearch.succeeded && unseenSearch.messages.size == 0)
+    check("clear seen", imapSetSeen(imap2, "INBOX", summary.uid, false).succeeded)
+    val combined = imapSearchMessages(imap2, "INBOX", ImapQuery(
+        unseen = true, from = qa1, subject = subject, since = "2026-11-01", text = "teste ($token)"
+    ), 5)
+    check("combined utf-8 search", combined.succeeded && combined.messages.size == 1, combined.error)
+    check("future since finds nothing", imapSearchMessages(imap2, "INBOX",
+        ImapQuery(subject = subject, since = "2099-01-01"), 5).matched == 0)
+    val missing = imapFetchMessage(imap2, "INBOX", "4000000000")
+    check("missing uid", !missing.found && missing.error == "message not found", missing.error)
+    val missingSeen = imapSetSeen(imap2, "INBOX", "4000000000", true)
+    check("missing uid seen", !missingSeen.succeeded && missingSeen.error == "message not found", missingSeen.error)
+    val noFolder = imapListMessages(imap2, "NoSuchFolder$token")
+    check("missing folder", !noFolder.succeeded && imapContains(noFolder.error, "mailbox not found"), noFolder.error)
+    val wrong = imapListMessages(imapFor(qa2, "wrong-$token"), "INBOX")
+    check("wrong password", !wrong.succeeded && wrong.error == "login failed", wrong.error)
+
+    val copy = waitFor(imap3, "INBOX", token)
+    check("cc copy for qa3", copy.succeeded && copy.messages.size == 1, copy.error)
+
+    // qa2 replies in the thread to qa1.
+    val reply = SmtpMessage(
+        qa2, qa2, "", qa1, "", "Re: $subject", "Recebido.\n\n> Olá QA dois", "",
+        "Tue, 03 Nov 2026 12:05:00 +0000", "reply.$token@$domain", "", "", "",
+        inReplyTo = summary.messageId, references = summary.messageId
+    )
+    val replied = smtpSend(smtpFor(qa2, password2), reply)
+    check("smtp reply", replied.succeeded, replied.detail)
+    val answer = waitFor(imap1, "INBOX", "Re: Olá $token")
+    check("reply arrived", answer.succeeded && answer.messages.size == 1, answer.error)
+    if (answer.messages.size == 1) {
+        check("reply in-reply-to", answer.messages[0].inReplyTo == summary.messageId, answer.messages[0].inReplyTo)
+        check("reply references", answer.messages[0].references == summary.messageId, answer.messages[0].references)
+    }
+
+    val fixture = environment("MAIL_FIXTURE_SUBJECT")
+    if (fixture != "") {
+        val found = waitFor(imap2, "INBOX", fixture)
+        check("fixture arrived", found.messages.size == 1, found.error)
+        if (found.messages.size == 1) {
+            val message = mimeParse(imapFetchMessage(imap2, "INBOX", found.messages[0].uid).raw)
+            println("fixture text: [${message.text}] html=${message.textFromHtml}")
+            for (attachment in message.attachments)
+                println("fixture attachment: ${attachment.name} ${attachment.contentType} ${attachment.size}")
+            check("fixture subject", message.subject == found.messages[0].subject)
+            check("fixture text", imapContains(message.text, "Ação"), message.text)
+            check("fixture attachments", message.attachments.size == 2)
+        }
+    }
+
+    if (failures == 0) println("live mail checks passed")
+    failures
+}
