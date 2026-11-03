@@ -43,5 +43,11 @@ fun main: int {
         imapTaggedOkay("A003 NO failed\r\n", "A003") ||
         imapFirstSearchUid("* SEARCH 42 91\r\nA003 OK done\r\n") != "42" ||
         imapFirstSearchUid("* SEARCH\r\nA003 OK done\r\n") != "") 1
+    else if (!contains(rendered, "Subject: O seu resumo\r\n")) 2
+    else if (!contains(rendered, "From: \"Kilo\" <updates@kilo.pt>")) 3
+    else if (smtpHeaderText("Olá") != smtpEncodedWord("Olá")) 4
+    else if (smtpDisplayName("A, B") != "\"A, B\"") 5
+    else if (smtpDisplayName("A\"B") != "\"A\\\"B\"") 6
+    else if (smtpHeaderSafe("Bad\r\nBcc: other@example.com")) 7
     else 0
 }

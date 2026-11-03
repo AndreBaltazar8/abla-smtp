@@ -74,8 +74,33 @@ fun smtpBase64Lines(value: string): string {
 fun smtpEncodedWord(value: string): string =
     if (value == "") "" else "=?UTF-8?B?${base64Encode(value)}?="
 
+// Keep ordinary ASCII headers readable; encode international text as before.
+fun smtpPrintableAscii(value: string): bool {
+    var index = 0
+    while (index < value.size) {
+        if (value[index] < 32 || value[index] > 126) return false
+        index = index + 1
+    }
+    true
+}
+
+fun smtpHeaderText(value: string): string =
+    if (smtpPrintableAscii(value)) value else smtpEncodedWord(value)
+
+fun smtpDisplayName(value: string): string {
+    if (!smtpPrintableAscii(value)) return smtpEncodedWord(value)
+    var result = byteEncode(34)
+    var index = 0
+    while (index < value.size) {
+        if (value[index] == 34 || value[index] == 92) result = "$result${byteEncode(92)}"
+        result = "$result${value.slice(index, index + 1)}"
+        index = index + 1
+    }
+    "$result${byteEncode(34)}"
+}
+
 fun smtpMailbox(address: string, name: string): string =
-    if (name == "") "<$address>" else "${smtpEncodedWord(name)} <$address>"
+    if (name == "") "<$address>" else "${smtpDisplayName(name)} <$address>"
 
 fun smtpPlainAuthentication(username: string, password: string): string =
     base64Encode("${byteEncode(0)}$username${byteEncode(0)}$password")
@@ -122,11 +147,11 @@ fun smtpMessageValid(message: SmtpMessage): bool =
 
 fun smtpRenderMessage(message: SmtpMessage): string {
     if (!smtpMessageValid(message)) return ""
-    val boundary = "abla-${base64Encode(sha256(message.messageId)).slice(0, 28)}"
+    val boundary = "=_${hexEncode(sha256(message.messageId)).slice(0, 48)}"
     var result = "Date: ${message.date}\r\n"
     result = "${result}From: ${smtpMailbox(message.fromAddress, message.fromName)}\r\n"
     result = "${result}To: ${smtpMailbox(message.toAddress, message.toName)}\r\n"
-    result = "${result}Subject: ${smtpEncodedWord(message.subject)}\r\n"
+    result = "${result}Subject: ${smtpHeaderText(message.subject)}\r\n"
     result = "${result}Message-ID: <${message.messageId}>\r\n"
     result = "${result}MIME-Version: 1.0\r\n"
     result = "${result}Content-Type: multipart/alternative; boundary=\"$boundary\"\r\n"
@@ -219,7 +244,7 @@ fun smtpAccepted(reply: SmtpReply, code: int): bool =
 fun smtpConnectTimeout(configured: int): int =
     if (configured < 1) 1 else if (configured > 10000) 10000 else configured
 
-fun smtpSend(config: SmtpConfig, message: SmtpMessage): SmtpSendResult {
+fun smtpSend(config: SmtpConfig, message: SmtpMessage, startTls: bool = false): SmtpSendResult {
     val rendered = smtpRenderMessage(message)
     if (rendered == "") return SmtpSendResult(
         false, "invalid_message", 0, false, true, "validation", "Invalid message fields."
@@ -228,11 +253,11 @@ fun smtpSend(config: SmtpConfig, message: SmtpMessage): SmtpSendResult {
         !smtpHeaderSafe(config.ehloName)) return SmtpSendResult(
         false, "invalid_configuration", 0, false, true, "configuration", "Invalid SMTP configuration."
     )
-    val connection = tlsConnect(config.host, config.port, smtpConnectTimeout(config.timeoutMilliseconds))
+    val connection = if (startTls) smtpStartTls(config) else tlsConnect(config.host, config.port, smtpConnectTimeout(config.timeoutMilliseconds))
     if (connection.handle < 0) return SmtpSendResult(
         false, "connect_failed", 0, true, false, "connect", tlsLastError()
     )
-    var reply = smtpRead(connection)
+    var reply = if (startTls) SmtpReply(true,220,"") else smtpRead(connection)
     var stage = "greeting"
     var okay = smtpAccepted(reply, 220)
     if (okay) {
@@ -273,4 +298,28 @@ fun smtpSend(config: SmtpConfig, message: SmtpMessage): SmtpSendResult {
     connection.close()
     if (okay) SmtpSendResult(true, "sent", 250, false, false, "message", "accepted")
     else smtpResult(reply, stage)
+}
+
+fun smtpRawRead(var connection: TcpConnection): SmtpReply {
+    var contents = ""
+    var reply = smtpParseReply(contents)
+    while (!reply.complete && contents.size < 65536) {
+        val chunk = connection.read(65536 - contents.size)
+        if (chunk.size == 0) return SmtpReply(false,0,contents)
+        contents = "$contents$chunk"
+        reply = smtpParseReply(contents)
+    }
+    reply
+}
+fun smtpRawCommand(var connection: TcpConnection, command: string): SmtpReply {
+    if (connection.write("$command\r\n") != command.size + 2) return SmtpReply(false,0,"")
+    smtpRawRead(connection)
+}
+fun smtpStartTls(config: SmtpConfig): TlsConnection {
+    val connection = tcpConnectHost(config.host,config.port,smtpConnectTimeout(config.timeoutMilliseconds))
+    if (connection.descriptor < 0) return TlsConnection(-1)
+    if (!smtpAccepted(smtpRawRead(connection),220)) return TlsConnection(-1)
+    if (!smtpAccepted(smtpRawCommand(connection,"EHLO ${config.ehloName}"),250)) return TlsConnection(-1)
+    if (!smtpAccepted(smtpRawCommand(connection,"STARTTLS"),220)) return TlsConnection(-1)
+    tlsUpgrade(connection,config.host)
 }
