@@ -40,7 +40,39 @@ fun mimeTests(): void {
         check("attachment type", message.attachments[0].contentType == "application/pdf")
         check("decoded size", message.attachments[0].size == 11)
         check("continued name", message.attachments[1].name == "logo.png")
+        check("plain parse keeps no bytes", message.attachments[0].content == "" && message.attachments[0].omitted == "")
     }
+
+    // The same message with the attachments' bytes.
+    val kept = mimeParseWithContent(raw, 1000, 10000)
+    check("with content: same text", kept.text == message.text && kept.attachments.size == 2)
+    if (kept.attachments.size == 2) {
+        check("base64 bytes decoded", kept.attachments[0].content == "Hello world" && kept.attachments[0].omitted == "")
+        check("attachment is not inline", !kept.attachments[0].inline && kept.attachments[0].contentId == "")
+        check("inline image flagged", kept.attachments[1].inline && kept.attachments[1].content == "xyz")
+        check("size and name unchanged", kept.attachments[0].size == 11 && kept.attachments[0].name == "fatura é.pdf")
+    }
+    val tight = mimeParseWithContent(raw, 5, 10000)
+    check("a part over its limit is listed without bytes, a small one keeps them", tight.attachments.size == 2 &&
+        tight.attachments[0].content == "" && tight.attachments[0].omitted == "too_large" && tight.attachments[0].size == 11 &&
+        tight.attachments[1].content == "xyz" && tight.attachments[1].omitted == "")
+    val total = mimeParseWithContent(raw, 100, 12)
+    check("total budget omits the part that would pass it", total.attachments.size == 2 &&
+        total.attachments[0].content == "Hello world" && total.attachments[1].content == "" &&
+        total.attachments[1].omitted == "total_too_large")
+
+    val binary = mimeParseWithContent("Content-Type: multipart/mixed; boundary=q\r\n\r\n--q\r\nContent-Type: text/plain\r\n\r\nsee file\r\n--q\r\n" +
+        "Content-Type: application/pdf\r\nContent-Disposition: attachment; filename=a.pdf\r\nContent-ID: <logo@x.pt>\r\n" +
+        "Content-Transfer-Encoding: base64\r\n\r\nAP/+\r\n--q\r\nContent-Type: application/octet-stream; name=q.bin\r\n" +
+        "Content-Transfer-Encoding: quoted-printable\r\n\r\na=3Db\r\n--q--\r\n", 1000, 10000)
+    check("body text still found", binary.text == "see file")
+    if (binary.attachments.size == 2) {
+        val bytes = binary.attachments[0].content
+        check("binary bytes survive", bytes.size == 3 && bytes[0] == 0 && bytes[1] == 255 && bytes[2] == 254)
+        check("content id without brackets", binary.attachments[0].contentId == "logo@x.pt")
+        check("quoted-printable attachment decoded", binary.attachments[1].content == "a=b")
+    } else check("two binary attachments", false)
+    check("no attachments, no content", mimeParseWithContent("Subject: s\r\n\r\nbody", 10, 10).attachments.size == 0)
 
     val html = mimeParse("Subject: x\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: base64\n\n" +
         base64Encode("<html><head><title>T</title><style>p{}</style></head><body><p>Hello&nbsp;<b>there</b> &amp; you</p>" +

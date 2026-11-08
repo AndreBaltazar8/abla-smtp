@@ -8,10 +8,17 @@ import "abla/text"
 
 class MimeHeader(val name: string, val value: string)
 
+// `content` is the decoded bytes, only from mimeParseWithContent and only when the part fits its limit; otherwise
+// `omitted` says why a part that was listed has no bytes. `inline` is Content-Disposition: inline, `contentId` the
+// Content-ID without its angle brackets ("" when absent), so a caller can tell a signature logo from a document.
 class MimeAttachment(
     val name: string,
     val contentType: string,
-    val size: int
+    val size: int,
+    val content: string = "",
+    val omitted: string = "",
+    val inline: bool = false,
+    val contentId: string = ""
 )
 
 class MimeMessage(
@@ -36,7 +43,11 @@ class MimeText(val text: string, val fromHtml: bool)
 
 class MimeCollector(
     val attachments: array<MimeAttachment>,
-    var parts: int
+    var parts: int,
+    val withContent: bool = false,
+    val maximumBytes: int = 0,
+    val maximumTotal: int = 0,
+    var total: int = 0
 )
 
 val mimeMaximumDepth = 8
@@ -642,6 +653,13 @@ fun mimeDelimiter(raw: string, boundary: string, from: int, end: int): int {
     -1
 }
 
+// The Content-ID header's id without whitespace and the angle brackets.
+fun mimeContentId(value: string): string {
+    var id = mimeTrim(value)
+    if (id.size >= 2 && id[0] == 60 && id[id.size - 1] == 62) id = id.slice(1, id.size - 1)
+    id
+}
+
 fun mimePart(
     raw: string,
     begin: int,
@@ -701,8 +719,23 @@ fun mimePart(
         (name != "" && disposition.mediaType != "inline")
     if (attachment) {
         val size = if (encoding == "base64") mimeBase64DecodedSize(body) else body.size
-        if (collector.attachments.size < mimeMaximumParts)
-            collector.attachments.append(MimeAttachment(name, mediaType, size))
+        if (collector.attachments.size < mimeMaximumParts) {
+            val inline = disposition.mediaType == "inline"
+            val contentId = mimeContentId(mimeHeaderRaw(headers, "Content-ID"))
+            var content = ""
+            var omitted = ""
+            if (collector.withContent) {
+                if (size > collector.maximumBytes) omitted = "too_large"
+                else if (collector.total + size > collector.maximumTotal) omitted = "total_too_large"
+                else {
+                    content = mimeTransferDecode(body, encoding)
+                    // A base64 body that does not decode to its measured size is damaged, not partial data to keep.
+                    if (encoding == "base64" && content.size != size) { content = ""; omitted = "undecodable" }
+                    else collector.total = collector.total + content.size
+                }
+            }
+            collector.attachments.append(MimeAttachment(name, mediaType, size, content, omitted, inline, contentId))
+        }
         return MimeText("", false)
     }
     val decoded = mimeToUtf8(mimeTransferDecode(body, encoding),
@@ -721,10 +754,18 @@ fun mimeUtf8Prefix(value: string, maximum: int): string {
 
 // Parses a raw RFC 5322 message (CRLF or LF line endings). The text is at
 // most 1 MiB; `truncated` says when more was cut off.
-fun mimeParse(raw: string): MimeMessage {
+fun mimeParse(raw: string): MimeMessage = mimeParseCollecting(raw, false, 0, 0)
+
+// As mimeParse, and each attachment also carries its decoded bytes when it is at most `maximumBytes`, and while the
+// bytes kept so far stay within `maximumTotal`. A part over either limit is still listed, with `omitted` set. The
+// structural limits (parts, depth, headers) are the same, so a hostile message costs no more than a plain parse.
+fun mimeParseWithContent(raw: string, maximumBytes: int, maximumTotal: int): MimeMessage =
+    mimeParseCollecting(raw, true, maximumBytes, maximumTotal)
+
+fun mimeParseCollecting(raw: string, withContent: bool, maximumBytes: int, maximumTotal: int): MimeMessage {
     val bodyBegin = mimeBodyBegin(raw, 0, raw.size)
     val headers = mimeParseHeaders(raw, 0, bodyBegin)
-    var collector = MimeCollector([], 0)
+    var collector = MimeCollector([], 0, withContent, maximumBytes, maximumTotal)
     val body = mimePart(raw, 0, raw.size, 0, collector)
     val text = mimeTrim(body.text)
     MimeMessage(

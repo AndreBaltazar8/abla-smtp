@@ -62,6 +62,14 @@ quoted-printable, base64 and RFC 2047/2231 names, reads UTF-8 and Latin-1
 (as Windows-1252), and lists attachments by name, type and decoded size without
 decoding them. Text is limited to 1 MiB, nesting to 8 levels and parts to 256.
 
+`mimeParseWithContent(raw, maximumBytes, maximumTotal)` does the same and also
+returns each attachment's decoded bytes in `content`, for a part of at most
+`maximumBytes` while the bytes kept stay within `maximumTotal`. A part over either
+limit is still listed, with `omitted` set to `too_large` or `total_too_large`
+(`undecodable` for a damaged base64 body). `inline` and `contentId` (the
+Content-ID without brackets) tell a signature logo from a document. The structural
+limits are the same as `mimeParse`, which keeps `content` empty.
+
 Responses are read line by line, following IMAP literals, so message contents
 can't end a response early. Every response, line and literal is bounded, read
 and write timeouts follow `timeoutMilliseconds` (1–60 s), and errors never
