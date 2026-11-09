@@ -161,6 +161,17 @@ fun main: int {
         }
     }
 
+    // Moving a message out of the INBOX (the destination, MAIL_TRASH, defaults to Trash).
+    val trashName = if (environment("MAIL_TRASH") == "") "Trash" else environment("MAIL_TRASH")
+    val moveUid = copy.messages[0].uid
+    val moved = imapMoveMessage(imap3, "INBOX", moveUid, trashName)
+    check("move to $trashName", moved.succeeded, moved.error)
+    check("moved message is gone from the INBOX", imapSearchMessages(imap3, "INBOX", ImapQuery(subject = copy.messages[0].subject), 5).messages.size == 0)
+    check("and is in $trashName", imapSearchMessages(imap3, trashName, ImapQuery(subject = copy.messages[0].subject), 5).messages.size >= 1)
+    val movedAgain = imapMoveMessage(imap3, "INBOX", moveUid, trashName)
+    check("moving it again says it is not there", !movedAgain.succeeded && movedAgain.error == "message not found", movedAgain.error)
+    check("moving to a mailbox that does not exist fails", !imapMoveMessage(imap2, "INBOX", summary.uid, "NoSuchFolder$token").succeeded)
+
     if (failures == 0) println("live mail checks passed")
     failures
 }

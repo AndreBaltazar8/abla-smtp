@@ -848,6 +848,51 @@ fun imapSetSeen(
     ImapActionResult(error == "", error)
 }
 
+// Moves one message to another mailbox of the same account, e.g. out of the INBOX once it is dealt with: RFC 6851 UID MOVE, and
+// where the server has no MOVE, UID COPY then \Deleted and UID EXPUNGE. The destination must already exist. The message is
+// searched for first (a UID that is not there is an error, not a silent success) and looked for again in the source afterwards.
+fun imapMoveMessage(
+    config: ImapConfig,
+    mailbox: string,
+    uid: string,
+    destination: string
+): ImapActionResult {
+    if (!imapConfigValid(config)) return ImapActionResult(false, "invalid configuration")
+    if (!imapMailboxValid(mailbox) || !imapMailboxValid(destination)) return ImapActionResult(false, "invalid mailbox")
+    if (mailbox == destination) return ImapActionResult(false, "same mailbox")
+    if (!imapUidValid(uid)) return ImapActionResult(false, "invalid uid")
+    var connection = imapConnect(config)
+    if (connection.handle < 0) return ImapActionResult(false, tlsLastError())
+    var error = imapOpenMailbox(connection, config, mailbox, false)
+    if (error == "") {
+        val target = imapAsciiDigits(uid, 0, uid.size)
+        val searched = imapRun(connection, "A003", "UID SEARCH UID $uid")
+        var exists = false
+        for (found in imapSearchUids(searched.contents)) if (found == target) exists = true
+        if (!imapOkay(searched)) error = "search failed"
+        else if (!exists) error = "message not found"
+        else {
+            val moved = imapRun(connection, "A004", "UID MOVE $uid ${imapQuote(destination)}")
+            if (!imapOkay(moved)) {
+                if (moved.status != "BAD") error = "move failed"
+                else {
+                    // No MOVE here: copy, mark the original deleted, expunge only that UID.
+                    val copied = imapRun(connection, "A005", "UID COPY $uid ${imapQuote(destination)}")
+                    if (!imapOkay(copied)) error = "copy failed"
+                    else if (!imapOkay(imapRun(connection, "A006", "UID STORE $uid +FLAGS.SILENT (\\Deleted)"))) error = "mark deleted failed"
+                    else if (!imapOkay(imapRun(connection, "A007", "UID EXPUNGE $uid"))) error = "expunge failed"
+                }
+            }
+            if (error == "") {
+                val again = imapRun(connection, "A008", "UID SEARCH UID $uid")
+                for (found in imapSearchUids(again.contents)) if (found == target) error = "message still in the source mailbox"
+            }
+        }
+    }
+    imapClose(connection)
+    ImapActionResult(error == "", error)
+}
+
 // CRLF line endings, as IMAP requires.
 fun imapCrlf(value: string): string {
     val buffer = byteBuffer()
