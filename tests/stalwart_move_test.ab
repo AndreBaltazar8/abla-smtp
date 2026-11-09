@@ -1,0 +1,41 @@
+// IMAP move against a Stalwart server, not part of `make test`: a throwaway container, as NovaKind's infra/mail/test-intake-proof.sh starts
+// (a self-signed certificate for `localhost`: run with SSL_CERT_FILE set to that certificate). Environment: IMAP_HOST (localhost), IMAP_PORT,
+// IMAP_USER, IMAP_PASSWORD and IMAP_TRASH (default "Deleted Items", Stalwart's Trash).
+import "../src/imap.ab"
+import "abla/io"
+import "abla/text"
+import "abla/sys/linux/process"
+
+var failures = 0
+
+fun check(name: string, passed: bool, detail: string = ""): void {
+    if (!passed) {
+        println("FAIL $name $detail")
+        failures = failures + 1
+    } else println("ok   $name")
+    return
+}
+
+fun environment(name: string): string = linuxEnvironment(name).value
+
+fun main: int {
+    val port = imapAsciiDigits(environment("IMAP_PORT"), 0, environment("IMAP_PORT").size)
+    val config = ImapConfig(environment("IMAP_HOST"), port, environment("IMAP_USER"), environment("IMAP_PASSWORD"), 10000)
+    val trash = if (environment("IMAP_TRASH") == "") "Deleted Items" else environment("IMAP_TRASH")
+    val subject = "move-probe-${linuxMonotonicMilliseconds()}"
+    val raw = "From: a@example.test\r\nTo: intake@in.novakind.co\r\nSubject: $subject\r\nMessage-ID: <$subject@probe>\r\n\r\nbody\r\n"
+    val filed = imapAppend(config, "INBOX", raw, false)
+    check("append to the INBOX", filed.succeeded, filed.error)
+    val found = imapSearchMessages(config, "INBOX", ImapQuery(subject = subject), 5)
+    check("the message is in the INBOX", found.succeeded && found.messages.size == 1, found.error)
+    val uid = found.messages[0].uid
+    val moved = imapMoveMessage(config, "INBOX", uid, trash)
+    check("move to $trash", moved.succeeded, moved.error)
+    check("gone from the INBOX", imapSearchMessages(config, "INBOX", ImapQuery(subject = subject), 5).messages.size == 0)
+    check("in $trash", imapSearchMessages(config, trash, ImapQuery(subject = subject), 5).messages.size == 1)
+    val again = imapMoveMessage(config, "INBOX", uid, trash)
+    check("moving it again says it is not there", !again.succeeded && again.error == "message not found", again.error)
+    check("the same mailbox is refused", imapMoveMessage(config, "INBOX", uid, "INBOX").error == "same mailbox")
+    if (failures == 0) println("stalwart move checks passed")
+    failures
+}
