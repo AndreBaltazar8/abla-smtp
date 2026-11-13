@@ -1,0 +1,26 @@
+// smtpSend over abla/tls/pure, implicit TLS and STARTTLS, against tests/tls_stand_in.ab (`make tls`). Argument 0 is the
+// stand-in's port, argument 1 "implicit" or "starttls"; the trust store is the one SSL_CERT_FILE names.
+import "../src/smtp.ab"
+import "abla/io"
+import "abla/process/arguments"
+
+fun toPort(text: string): int {
+    var value = 0
+    for (at in 0 until text.size) value = value * 10 + int(text[at]) - 48
+    value
+}
+
+fun main: int {
+    val message = SmtpMessage(
+        "bounces@example.com", "updates@example.com", "Updates", "reader@example.com", "Reader", "Subject over TLS",
+        "A short text body.", "", "Tue, 11 Aug 2026 12:00:00 +0000", "id.1@example.com", "", "", ""
+    )
+    val config = SmtpConfig("localhost", toPort(processArgument(0)), "", "", "client.example.com", 5000)
+    val result = smtpSend(config, message, processArgument(1) == "starttls")
+    if (!result.succeeded) {
+        println("FAIL ${processArgument(1)}: ${result.code} ${result.stage}: ${result.detail}")
+        return 1
+    }
+    println("smtp over tls ${processArgument(1)} ok")
+    0
+}

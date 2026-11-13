@@ -1,6 +1,6 @@
 import "abla/crypto"
 import "abla/bytes"
-import "abla/tls/hosted"
+import "abla/tls/pure"
 import "abla/text"
 
 class SmtpConfig(
@@ -396,9 +396,9 @@ fun smtpRawCommand(var connection: TcpConnection, command: string): SmtpReply {
 }
 fun smtpStartTls(config: SmtpConfig): TlsConnection {
     val connection = tcpConnectHost(config.host,config.port,smtpConnectTimeout(config.timeoutMilliseconds))
-    if (connection.descriptor < 0) return TlsConnection(-1)
-    if (!smtpAccepted(smtpRawRead(connection),220)) return TlsConnection(-1)
-    if (!smtpAccepted(smtpRawCommand(connection,"EHLO ${config.ehloName}"),250)) return TlsConnection(-1)
-    if (!smtpAccepted(smtpRawCommand(connection,"STARTTLS"),220)) return TlsConnection(-1)
+    if (connection.descriptor < 0) return tlsFailedConnection()
+    if (!smtpAccepted(smtpRawRead(connection),220)) return tlsFailedConnection()
+    if (!smtpAccepted(smtpRawCommand(connection,"EHLO ${config.ehloName}"),250)) return tlsFailedConnection()
+    if (!smtpAccepted(smtpRawCommand(connection,"STARTTLS"),220)) return tlsFailedConnection()
     tlsUpgrade(connection,config.host)
 }

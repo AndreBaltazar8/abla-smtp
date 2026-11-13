@@ -1,0 +1,76 @@
+// A one-connection SMTP server over abla/tls/pure for tests/tls_test.ab (run by `make tls`):
+//   tls_stand_in implicit CERT KEY PORTFILE   TLS from the first byte
+//   tls_stand_in starttls CERT KEY PORTFILE   plain greeting, EHLO, STARTTLS, then TLS
+// It listens on a free port (written to PORTFILE), serves one message and writes what it received to PORTFILE.mail.
+import "abla/fs"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux/net"
+import "abla/tls/pure"
+
+fun reply(command: string): string {
+    if (command.startsWith("EHLO")) return "250-stand-in\r\n250 STARTTLS\r\n"
+    if (command.startsWith("MAIL FROM") || command.startsWith("RCPT TO")) return "250 ok\r\n"
+    if (command.startsWith("DATA")) return "354 go ahead\r\n"
+    if (command.startsWith("QUIT")) return "221 bye\r\n"
+    "502 not implemented\r\n"
+}
+
+/** Answers commands until QUIT; the message body is what arrives between DATA and the lone dot. */
+fun serve(var connection: TlsConnection, mail: Path): int {
+    var pending = ""
+    var data = false
+    var received = ""
+    var quitting = false
+    while (!quitting) {
+        val chunk = connection.read(4096)
+        if (chunk == "") return 1
+        pending = pending + chunk
+        var end = pending.indexOf("\r\n")
+        while (end >= 0 && !quitting) {
+            val line = pending.slice(0, end)
+            pending = pending.slice(end + 2, pending.size)
+            if (data) {
+                if (line == ".") {
+                    data = false
+                    connection.write("250 queued\r\n")
+                } else received = received + line + "\n"
+            } else {
+                connection.write(reply(line))
+                if (line.startsWith("DATA")) data = true
+                if (line.startsWith("QUIT")) quitting = true
+            }
+            end = pending.indexOf("\r\n")
+        }
+    }
+    mail.writeText(received)
+    connection.close()
+    0
+}
+
+fun main: int {
+    val mode = processArgument(0)
+    val listener = tcpListenIpv6(ipv6SocketAddress("::", 0), 4, true)
+    if (listener.descriptor < 0) return 2
+    val portFile = path(processArgument(3))
+    val mail = path(processArgument(3) + ".mail")
+    portFile.writeText("${listener.localPort()}")
+    var accepted = listener.accept()
+    if (accepted.descriptor < 0) return 3
+    if (mode == "implicit") {
+        var tls = tlsServerUpgrade(accepted, processArgument(1), processArgument(2), 5000, 5000)
+        if (tls.handle == -1) return 4
+        tls.write("220 stand-in ready\r\n")
+        return serve(tls, mail)
+    }
+    accepted.write("220 stand-in ready\r\n")
+    var greeting = accepted.read(4096)
+    if (!greeting.startsWith("EHLO")) return 5
+    accepted.write("250-stand-in\r\n250 STARTTLS\r\n")
+    var request = accepted.read(4096)
+    if (!request.startsWith("STARTTLS")) return 6
+    accepted.write("220 go ahead\r\n")
+    var tls = tlsServerUpgrade(accepted, processArgument(1), processArgument(2), 5000, 5000)
+    if (tls.handle == -1) return 7
+    serve(tls, mail)
+}
