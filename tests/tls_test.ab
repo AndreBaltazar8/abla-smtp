@@ -1,5 +1,7 @@
 // smtpSend over abla/tls/pure, implicit TLS and STARTTLS, against tests/tls_stand_in.ab (`make tls`). Argument 0 is the
-// stand-in's port, argument 1 "implicit" or "starttls"; the trust store is the one SSL_CERT_FILE names.
+// stand-in's port, argument 1 "implicit" or "starttls", argument 2 the host name to connect to and verify, argument 3 "sent"
+// or a text the refusal must hold (the connection must then fail at the connect stage, nothing sent); the trust store is the
+// one SSL_CERT_FILE names.
 import "../src/smtp.ab"
 import "abla/io"
 import "abla/process/arguments"
@@ -15,8 +17,17 @@ fun main: int {
         "bounces@example.com", "updates@example.com", "Updates", "reader@example.com", "Reader", "Subject over TLS",
         "A short text body.", "", "Tue, 11 Aug 2026 12:00:00 +0000", "id.1@example.com", "", "", ""
     )
-    val config = SmtpConfig("localhost", toPort(processArgument(0)), "", "", "client.example.com", 5000)
+    val config = SmtpConfig(processArgument(2), toPort(processArgument(0)), "", "", "client.example.com", 5000)
     val result = smtpSend(config, message, processArgument(1) == "starttls")
+    val expected = processArgument(3)
+    if (expected != "sent") {
+        if (result.succeeded || result.code != "connect_failed" || !result.detail.contains(expected)) {
+            println("FAIL ${processArgument(1)}: wanted a refusal with '$expected', got ${result.succeeded} ${result.code}: ${result.detail}")
+            return 1
+        }
+        println("smtp over tls ${processArgument(1)} refused ok (${result.detail})")
+        return 0
+    }
     if (!result.succeeded) {
         println("FAIL ${processArgument(1)}: ${result.code} ${result.stage}: ${result.detail}")
         return 1
