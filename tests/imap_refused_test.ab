@@ -1,0 +1,16 @@
+// The IMAP calls that open their own connection (fetch the first unseen message, mark one seen), against a port nothing
+// listens on: each reports the failed connection and neither panics. It also keeps these functions compiled by `make test`.
+import "../src/imap.ab"
+import "abla/io"
+
+fun main: int {
+    val config = ImapConfig("127.0.0.1", 1, "user", "password", 500)
+    val fetched = imapFetchFirstUnseen(config)
+    val marked = imapMarkSeenResult(config, "1")
+    if (fetched.found || marked.succeeded) {
+        println("FAIL: an IMAP call succeeded with no server")
+        return 1
+    }
+    println("imap refused tests passed")
+    0
+}

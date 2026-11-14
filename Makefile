@@ -11,6 +11,8 @@ test:
 	$(BUILD_DIR)/smtp_test
 	cd $(ABLAC_DIR) && $(COMPILER) build $(PROJECT_DIR)/tests/mail_test.ab -o $(BUILD_DIR)/mail_test --fast --no-cache
 	$(BUILD_DIR)/mail_test
+	cd $(ABLAC_DIR) && $(COMPILER) build $(PROJECT_DIR)/tests/imap_refused_test.ab -o $(BUILD_DIR)/imap_refused_test --fast --no-cache
+	$(BUILD_DIR)/imap_refused_test
 	$(MAKE) tls
 
 # smtpSend over abla/tls/pure, implicit TLS and STARTTLS, against a stand-in server: sent, and refused for another host name and
