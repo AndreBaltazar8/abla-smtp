@@ -1,6 +1,7 @@
 import "smtp.ab"
 import "mime.ab"
 import "abla/text"
+import "abla/tls/pure"
 
 class ImapConfig(
     val host: string,
@@ -114,7 +115,7 @@ fun imapFetchFirstUnseenConfigured(
 ): ImapFetchedMessage {
     if (!imapSafeCredential(config.username) || !imapSafeCredential(config.password))
         return ImapFetchedMessage(false, "", "", "invalid configuration")
-    val connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
+    var connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
     if (connection.handle < 0)
         return ImapFetchedMessage(false, "", "", tlsLastError())
     val greeting = connection.read(8192)
@@ -175,7 +176,7 @@ fun imapMarkSeenResult(config: ImapConfig, uid: string): ImapActionResult {
     if (!imapSafeCredential(config.username) ||
         !imapSafeCredential(config.password) || !imapUidValid(uid))
         return ImapActionResult(false, "invalid configuration")
-    val connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
+    var connection = tlsConnect(config.host, config.port, config.timeoutMilliseconds)
     if (connection.handle < 0) return ImapActionResult(false, tlsLastError())
     val greeting = connection.read(8192)
     if (!imapContains(greeting, "* OK")) {
