@@ -2,6 +2,7 @@ import "smtp.ab"
 import "mime.ab"
 import "abla/text"
 import "abla/tls/pure"
+import "abla/bytes"
 
 class ImapConfig(
     val host: string,

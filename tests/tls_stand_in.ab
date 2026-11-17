@@ -7,6 +7,7 @@ import "abla/io"
 import "abla/process/arguments"
 import "abla/sys/linux/net"
 import "abla/tls/pure"
+import "abla/text"
 
 fun reply(command: string): string {
     if (command.startsWith("EHLO")) return "250-stand-in\r\n250 STARTTLS\r\n"

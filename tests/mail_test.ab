@@ -1,6 +1,9 @@
 import "../src/smtp.ab"
 import "../src/imap.ab"
 import "abla/io"
+import "../src/mime.ab"
+import "abla/crypto"
+import "abla/bytes"
 
 var failures = 0
 

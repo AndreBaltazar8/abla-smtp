@@ -5,6 +5,7 @@
 import "../src/smtp.ab"
 import "abla/io"
 import "abla/process/arguments"
+import "abla/text"
 
 fun toPort(text: string): int {
     var value = 0

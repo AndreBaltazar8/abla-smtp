@@ -2,6 +2,8 @@ import "abla/crypto"
 import "abla/bytes"
 import "abla/tls/pure"
 import "abla/text"
+import "abla/sys/linux/net"
+import "abla/dns"
 
 class SmtpConfig(
     val host: string,

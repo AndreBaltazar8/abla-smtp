@@ -7,6 +7,8 @@ import "../src/smtp.ab"
 import "../src/imap.ab"
 import "abla/io"
 import "abla/sys/linux/process"
+import "../src/mime.ab"
+import "abla/text"
 
 var failures = 0
 
