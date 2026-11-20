@@ -3,7 +3,6 @@
 //   tls_stand_in starttls CERT KEY PORTFILE   plain greeting, EHLO, STARTTLS, then TLS
 // It listens on a free port (written to PORTFILE), serves one message and writes what it received to PORTFILE.mail.
 import "abla/fs"
-import "abla/io"
 import "abla/process/arguments"
 import "abla/sys/linux/net"
 import "abla/tls/pure"

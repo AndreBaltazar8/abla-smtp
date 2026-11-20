@@ -3,7 +3,6 @@
 // IMAP_USER, IMAP_PASSWORD and IMAP_TRASH (default "Deleted Items", Stalwart's Trash).
 import "../src/imap.ab"
 import "abla/io"
-import "abla/text"
 import "abla/sys/linux/process"
 
 var failures = 0
